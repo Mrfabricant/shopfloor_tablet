@@ -3,6 +3,8 @@
 	const API = "shopfloor_tablet.api.";
 	const IDLE_SECONDS = 90; // shared tablet: go back to the name list after this much inactivity
 	const REFRESH_SECONDS = 30;
+	const ACCENTS = 6; // number of Work Order colours (sft-acc-0 .. sft-acc-5 in the CSS)
+	const MAX_MACHINE_CHIPS = 6; // more machines than this: dropdown instead of buttons
 
 	const esc = (v) => frappe.utils.escape_html(v == null ? "" : String(v));
 
@@ -16,6 +18,9 @@
 		secs = Math.max(0, Math.floor(secs));
 		return `${pad(Math.floor(secs / 3600))}:${pad(Math.floor((secs % 3600) / 60))}:${pad(secs % 60)}`;
 	};
+
+	const ICON_MACHINE = `<svg class="sft-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`;
+	const ICON_TICK = `<svg class="sft-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" d="M5 12.5l4.5 4.5L19 7.5"/></svg>`;
 
 	frappe.pages[PAGE].on_page_load = function (wrapper) {
 		const page = frappe.ui.make_app_page({
@@ -50,6 +55,10 @@
 				loadedAt: Date.now(),
 				finishing: null,
 			};
+			// Work Order -> colour index. Kept for the session so a Work Order keeps its colour
+			// across refreshes and on the active-work card.
+			this.accents = {};
+			this.nextAccent = 0;
 			this.lastActivity = Date.now();
 			this.lastRefresh = Date.now();
 			this.searchTimer = null;
@@ -92,6 +101,13 @@
 			return msg || "Something went wrong. Please try again.";
 		}
 
+		accent(work_order) {
+			if (!(work_order in this.accents)) {
+				this.accents[work_order] = this.nextAccent++ % ACCENTS;
+			}
+			return `sft-acc-${this.accents[work_order]}`;
+		}
+
 		bind() {
 			const me = this;
 			this.$root.on("pointerdown keydown", () => (this.lastActivity = Date.now()));
@@ -119,6 +135,7 @@
 
 			this.$root.on("change", "[data-role=machine]", function () {
 				me.s.machine = $(this).val();
+				me.render_summary();
 			});
 
 			this.$root.on("input", "[data-role=good], [data-role=scrap]", () => this.update_finish_hint());
@@ -132,6 +149,8 @@
 					return this.show_picker();
 				case "select-op":
 					return this.select_op($el.attr("data-jc"));
+				case "pick-machine":
+					return this.pick_machine($el.attr("data-machine"));
 				case "start":
 					return this.start();
 				case "finish-open":
@@ -332,15 +351,46 @@
 			$b.html(html);
 		}
 
-		active_card(a) {
+		machine_chip(machine) {
+			return `<span class="sft-chip sft-chip-machine">${ICON_MACHINE}${esc(machine || "-")}</span>`;
+		}
+
+		progress(o) {
+			const req = Number(o.required) || 0;
+			const pct = (v) => (req > 0 ? Math.max(0, Math.min(100, (Number(v || 0) / req) * 100)) : 0);
 			return `
-				<div class="sft-card sft-active">
-					<div class="sft-active-label">Working now</div>
+				<div class="sft-progress" role="img"
+					aria-label="good ${fmt(o.good)}, scrap ${fmt(o.scrap)}, left ${fmt(o.remaining)} of ${fmt(req)}">
+					<span class="sft-bar-good" style="width:${pct(o.good)}%"></span>
+					<span class="sft-bar-scrap" style="width:${pct(o.scrap)}%"></span>
+				</div>
+				<div class="sft-progress-legend">
+					<span><i class="sft-dot sft-dot-good"></i>Good ${fmt(o.good)}</span>
+					<span><i class="sft-dot sft-dot-scrap"></i>Scrap ${fmt(o.scrap)}</span>
+					<span><i class="sft-dot sft-dot-left"></i>Left ${fmt(o.remaining)}</span>
+				</div>`;
+		}
+
+		active_card(a) {
+			const done = Math.max(0, (Number(a.required) || 0) - (Number(a.remaining) || 0));
+			return `
+				<div class="sft-card sft-active ${this.accent(a.work_order)}">
+					<div class="sft-active-head">
+						<span class="sft-live-dot"></span>
+						<span class="sft-active-label">Working now</span>
+						<span class="sft-active-wo">${esc(a.work_order)}</span>
+					</div>
 					<div class="sft-op-title">${esc(a.operation)}</div>
-					<div class="sft-op-sub">${esc(a.item_name)} &middot; ${esc(a.work_order)}</div>
-					<div class="sft-op-sub">Machine: ${esc(a.machine || "-")} &middot; started ${esc(a.started_at)}</div>
+					<div class="sft-active-item">${esc(a.item_name)}</div>
+					<div class="sft-chips">
+						${this.machine_chip(a.machine)}
+						<span class="sft-chip">Started ${esc(a.started_at)}</span>
+					</div>
 					<div class="sft-timer" data-elapsed="${a.elapsed_seconds}">${clock(a.elapsed_seconds)}</div>
-					<div class="sft-op-sub">Left on this operation: <b>${fmt(a.remaining)}</b> ${esc(a.uom || "")}</div>
+					<div class="sft-progress" role="img" aria-label="done ${fmt(done)}, left ${fmt(a.remaining)} of ${fmt(a.required)}">
+						<span class="sft-bar-done" style="width:${a.required > 0 ? Math.min(100, (done / a.required) * 100) : 0}%"></span>
+					</div>
+					<div class="sft-active-left">Left on this operation: <b>${fmt(a.remaining)}</b> of ${fmt(a.required)} ${esc(a.uom || "")}</div>
 					<button class="sft-btn sft-btn-finish" data-action="finish-open" data-row="${esc(a.row_name)}">FINISH</button>
 					<button class="sft-btn sft-btn-link" data-action="cancel-start" data-row="${esc(a.row_name)}">Started by mistake - cancel</button>
 				</div>`;
@@ -350,36 +400,62 @@
 			const $ops = this.$root.find(".sft-ops");
 			if (!$ops.length) return;
 
+			$ops.toggleClass("sft-has-selection", !!this.s.selected);
+
 			if (!this.s.operations.length) {
 				$ops.html('<div class="sft-empty">No open operations. Work orders are created in ERPNext.</div>');
 				return;
 			}
 
-			let html = "";
-			let lastWo = null;
+			// operations arrive sorted by Work Order, then sequence: group them into blocks
+			const blocks = [];
 			for (const o of this.s.operations) {
-				if (o.work_order !== lastWo) {
-					lastWo = o.work_order;
-					html += `<div class="sft-group">${esc(o.work_order)} &middot; ${esc(o.item_name)}</div>`;
+				let b = blocks[blocks.length - 1];
+				if (!b || b.work_order !== o.work_order) {
+					b = { work_order: o.work_order, item_name: o.item_name, ops: [] };
+					blocks.push(b);
 				}
-				const sel = this.s.selected === o.job_card ? " sft-selected" : "";
-				const working = (o.working_now || []).length
-					? `<div class="sft-op-sub sft-working">Working now: ${esc(o.working_now.join(", "))}</div>`
-					: "";
-				html += `
-					<div class="sft-card sft-op${sel}" data-action="select-op" data-jc="${esc(o.job_card)}">
-						<div class="sft-op-main">
-							<div class="sft-op-title">${esc(o.operation)}</div>
-							<div class="sft-op-sub">Machine: ${esc(o.machine || "-")}</div>
-							${working}
-						</div>
-						<div class="sft-op-qty">
-							<div class="sft-qty-big">${fmt(o.remaining)}</div>
-							<div class="sft-op-sub">left of ${fmt(o.required)} ${esc(o.uom || "")}</div>
-						</div>
-					</div>`;
+				b.ops.push(o);
 			}
-			$ops.html(html);
+
+			$ops.html(blocks.map((b) => this.wo_block(b)).join(""));
+		}
+
+		wo_block(b) {
+			const n = b.ops.length;
+			const cards = b.ops
+				.map((o, i) => {
+					const sel = this.s.selected === o.job_card ? " sft-selected" : "";
+					const working = (o.working_now || []).length
+						? `<div class="sft-working">Working now:
+							${o.working_now.map((w) => `<span class="sft-chip sft-chip-worker">${esc(w)}</span>`).join("")}</div>`
+						: "";
+					return `
+						<div class="sft-card sft-op${sel}" data-action="select-op" data-jc="${esc(o.job_card)}">
+							<div class="sft-step">${i + 1}</div>
+							<div class="sft-op-main">
+								<div class="sft-op-title">${esc(o.operation)}</div>
+								<div class="sft-chips">${this.machine_chip(o.machine)}</div>
+								${this.progress(o)}
+								${working}
+							</div>
+							<div class="sft-op-qty">
+								<div class="sft-qty-big">${fmt(o.remaining)}</div>
+								<div class="sft-op-sub">left of ${fmt(o.required)} ${esc(o.uom || "")}</div>
+							</div>
+							<div class="sft-tick">${ICON_TICK}</div>
+						</div>`;
+				})
+				.join("");
+			return `
+				<section class="sft-wo ${this.accent(b.work_order)}">
+					<div class="sft-wo-head">
+						<div class="sft-wo-no">${esc(b.work_order)}</div>
+						<div class="sft-wo-item">${esc(b.item_name)}</div>
+						<div class="sft-wo-count">${n} ${n === 1 ? "operation" : "operations"} open</div>
+					</div>
+					${cards}
+				</section>`;
 		}
 
 		select_op(jc) {
@@ -388,10 +464,25 @@
 			this.s.selected = jc;
 			this.s.machine = op.machine || "";
 			this.s.error = "";
+			this.$root.find(".sft-ops").addClass("sft-has-selection");
 			this.$root.find(".sft-op").removeClass("sft-selected");
 			this.$root.find(`.sft-op[data-jc="${CSS.escape(jc)}"]`).addClass("sft-selected");
 			this.render_banner();
 			this.render_startbar();
+		}
+
+		pick_machine(machine) {
+			this.s.machine = machine || "";
+			this.$root.find(".sft-machine-btn").each(function () {
+				$(this).toggleClass("sft-on", $(this).attr("data-machine") === machine);
+			});
+			this.render_summary();
+		}
+
+		machine_options(op) {
+			const machines = this.s.machines.slice();
+			if (op.machine && !machines.includes(op.machine)) machines.unshift(op.machine);
+			return machines;
 		}
 
 		render_startbar() {
@@ -404,24 +495,52 @@
 				return;
 			}
 
-			const machines = this.s.machines.slice();
-			if (op.machine && !machines.includes(op.machine)) machines.unshift(op.machine);
-			const options = ['<option value="">Choose machine</option>']
-				.concat(
-					machines.map(
-						(m) => `<option value="${esc(m)}"${m === this.s.machine ? " selected" : ""}>${esc(m)}</option>`
+			const machines = this.machine_options(op);
+			let picker;
+			if (machines.length <= MAX_MACHINE_CHIPS) {
+				picker = `<div class="sft-machine-grid">${machines
+					.map(
+						(m) => `<button class="sft-machine-btn${m === this.s.machine ? " sft-on" : ""}"
+							data-action="pick-machine" data-machine="${esc(m)}">
+							${ICON_MACHINE}<span class="sft-machine-name">${esc(m)}</span>
+							${m === op.machine ? '<span class="sft-default">Default</span>' : ""}
+						</button>`
 					)
-				)
-				.join("");
+					.join("")}</div>`;
+			} else {
+				const options = ['<option value="">Choose machine</option>']
+					.concat(
+						machines.map(
+							(m) =>
+								`<option value="${esc(m)}"${m === this.s.machine ? " selected" : ""}>${esc(m)}${
+									m === op.machine ? " (default)" : ""
+								}</option>`
+						)
+					)
+					.join("");
+				picker = `<select class="sft-input sft-select" data-role="machine">${options}</select>`;
+			}
 
-			$bar.html(`
-				<div class="sft-startbar-info">
-					<b>${esc(op.operation)}</b> &middot; ${esc(op.work_order)}
-				</div>
-				<label class="sft-label">Machine</label>
-				<select class="sft-input sft-select" data-role="machine">${options}</select>
+			$bar.attr("class", `sft-startbar ${this.accent(op.work_order)}`).html(`
+				<div class="sft-label">Machine</div>
+				${picker}
+				<div class="sft-summary"></div>
 				<button class="sft-btn sft-btn-start" data-action="start">START</button>
 			`);
+			this.render_summary();
+		}
+
+		render_summary() {
+			const op = this.s.operations.find((o) => o.job_card === this.s.selected);
+			if (!op) return;
+			const machine = this.s.machine
+				? esc(this.s.machine)
+				: '<span class="sft-summary-missing">choose a machine</span>';
+			this.$root
+				.find(".sft-summary")
+				.html(
+					`<b>${esc(op.work_order)}</b> &middot; ${esc(op.item_name)} &middot; <b>${esc(op.operation)}</b> &middot; ${machine}`
+				);
 		}
 
 		// ------------------------------------------------------------ actions
@@ -497,11 +616,14 @@
 			this.$root.find(".sft-modal").remove();
 			this.$root.append(`
 				<div class="sft-modal">
-					<div class="sft-modal-box">
+					<div class="sft-modal-box ${this.accent(a.work_order)}">
 						<div class="sft-title">Finish work</div>
-						<div class="sft-op-title">${esc(a.operation)}</div>
-						<div class="sft-op-sub">${esc(a.item_name)} &middot; ${esc(a.work_order)}</div>
-						<div class="sft-op-sub">Left on this operation: <b>${fmt(a.remaining)}</b> ${esc(a.uom || "")}</div>
+						<div class="sft-modal-summary">
+							<div class="sft-op-title">${esc(a.operation)}</div>
+							<div class="sft-op-sub"><b>${esc(a.work_order)}</b> &middot; ${esc(a.item_name)}</div>
+							<div class="sft-chips">${this.machine_chip(a.machine)}</div>
+							<div class="sft-modal-left">Left on this operation: <b>${fmt(a.remaining)}</b> ${esc(a.uom || "")}</div>
+						</div>
 
 						<label class="sft-label">Good quantity</label>
 						<input class="sft-input sft-qtyinput" data-role="good" type="number" inputmode="decimal"
@@ -509,7 +631,7 @@
 						<button class="sft-btn sft-btn-ghost sft-small" data-action="all-remaining">All remaining is good</button>
 
 						<label class="sft-label">Scrap quantity</label>
-						<input class="sft-input sft-qtyinput" data-role="scrap" type="number" inputmode="decimal"
+						<input class="sft-input sft-qtyinput sft-qty-scrap" data-role="scrap" type="number" inputmode="decimal"
 							min="0" step="any" placeholder="0">
 
 						<div class="sft-reason sft-hidden">
