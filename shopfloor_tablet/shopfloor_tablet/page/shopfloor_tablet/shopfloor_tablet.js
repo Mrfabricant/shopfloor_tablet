@@ -502,7 +502,8 @@
 					.map(
 						(m) => `<button class="sft-machine-btn${m === this.s.machine ? " sft-on" : ""}"
 							data-action="pick-machine" data-machine="${esc(m)}">
-							${ICON_MACHINE}<span class="sft-machine-name">${esc(m)}</span>
+							<span class="sft-machine-row">${ICON_MACHINE}<span class="sft-machine-name">${esc(m)}</span>
+								<span class="sft-machine-check">${ICON_TICK}</span></span>
 							${m === op.machine ? '<span class="sft-default">Default</span>' : ""}
 						</button>`
 					)
