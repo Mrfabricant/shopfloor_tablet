@@ -432,7 +432,7 @@
 						: "";
 					return `
 						<div class="sft-card sft-op${sel}" data-action="select-op" data-jc="${esc(o.job_card)}">
-							<div class="sft-step">${i + 1}</div>
+							<div class="sft-step">${o.sequence_id || i + 1}</div>
 							<div class="sft-op-main">
 								<div class="sft-op-title">${esc(o.operation)}</div>
 								<div class="sft-chips">${this.machine_chip(o.machine)}</div>

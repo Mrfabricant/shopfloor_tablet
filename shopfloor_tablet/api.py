@@ -331,6 +331,7 @@ def list_open_operations(search=None, limit=200):
 				"job_card": c.name,
 				"work_order": c.work_order,
 				"operation": c.operation,
+				"sequence_id": cint(c.sequence_id) or None,
 				"item_code": c.production_item,
 				"item_name": c.item_name or c.production_item,
 				"uom": c.stock_uom,
