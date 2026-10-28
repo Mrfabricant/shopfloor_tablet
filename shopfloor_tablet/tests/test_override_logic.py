@@ -58,6 +58,10 @@ def _install_stubs():
 
 	class JobCard:
 		calls = []
+		is_corrective_job_card = 0
+
+		def validate(self):
+			self.calls.append("standard_validate")
 
 		def get(self, key, default=None):
 			return getattr(self, key, default)
@@ -81,12 +85,16 @@ def _install_stubs():
 			self.calls.append("standard_sequence")
 
 	jc_mod.JobCard = JobCard
+
+	settings = types.ModuleType("shopfloor_tablet.settings")
+	settings.break_config = lambda: ("10:30:00", "11:00:00", "Europe/Zagreb", "Europe/Zagreb")
 	sys.modules.update(
 		{
 			"frappe": frappe,
 			"frappe.utils": utils,
 			"erpnext": erp,
 			"erpnext.manufacturing.doctype.job_card.job_card": jc_mod,
+			"shopfloor_tablet.settings": settings,
 		}
 	)
 	return jc_mod.JobCard
@@ -96,7 +104,9 @@ def _install_stubs():
 class TestShopfloorJobCardLogic(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
-		cls._saved = {k: sys.modules.get(k) for k in ("frappe", "frappe.utils", "erpnext")}
+		cls._saved = {
+			k: sys.modules.get(k) for k in ("frappe", "frappe.utils", "erpnext", "shopfloor_tablet.settings")
+		}
 		cls.Base = _install_stubs()
 		sys.modules.pop("shopfloor_tablet.overrides.job_card", None)
 		cls.mod = importlib.import_module("shopfloor_tablet.overrides.job_card")
@@ -152,14 +162,16 @@ class TestShopfloorJobCardLogic(unittest.TestCase):
 		c.validate_sequence_id()
 		self.assertEqual(self.Base.calls, ["standard_sequence"])
 
-	def test_scrap_is_sum_of_reported_scrap_not_unfinished_work(self):
+	def test_tablet_cards_have_no_process_loss(self):
+		"""Scrap lives in the rows; it is not unfinished work and not header process loss."""
 		rows = [
 			Row(from_tablet=1, to_time="2026-10-27 10:00:00", completed_qty=30, scrap_qty=2),
 			Row(from_tablet=1, to_time="2026-10-27 11:00:00", completed_qty=20, scrap_qty=1),
 		]
 		c = self.card(rows, for_quantity=100, completed=50)
+		c.process_loss_qty = 7
 		c.set_process_loss()
-		self.assertEqual(c.process_loss_qty, 3)
+		self.assertEqual(c.process_loss_qty, 0)
 		self.assertNotIn("standard_process_loss", self.Base.calls)
 
 	def test_cards_without_tablet_rows_use_standard_process_loss(self):
@@ -174,9 +186,58 @@ class TestShopfloorJobCardLogic(unittest.TestCase):
 		]
 		c = self.card(rows, for_quantity=100, completed=50)
 		c.before_submit()
-		self.assertEqual(c.process_loss_qty, 3)
-		self.assertEqual(c.pending_qty, 47)
+		self.assertEqual(c.process_loss_qty, 0)
+		self.assertEqual(c.pending_qty, 50)
 		self.assertEqual(c.total_completed_qty + c.process_loss_qty + c.pending_qty, c.for_quantity)
+
+	def test_submit_ten_planned_ten_good_with_scrap(self):
+		# 10 planned: 7 good + 2 scrap, then 3 good -> 10 good, nothing pending, no process loss
+		rows = [
+			Row(from_tablet=1, from_time="2026-10-27 08:00:00", to_time="2026-10-27 09:00:00", employee="E1", completed_qty=7, scrap_qty=2),
+			Row(from_tablet=1, from_time="2026-10-27 09:00:00", to_time="2026-10-27 10:00:00", employee="E1", completed_qty=3, scrap_qty=0),
+		]
+		c = self.card(rows, for_quantity=10, completed=10)
+		c.before_submit()
+		self.assertEqual((c.process_loss_qty, c.pending_qty), (0, 0))
+
+	def test_corrective_card_with_zero_quantity_adds_up(self):
+		rows = [Row(from_tablet=1, from_time="2026-10-27 08:00:00", to_time="2026-10-27 09:00:00", employee="E1", completed_qty=0, scrap_qty=0)]
+		c = self.card(rows, for_quantity=0, completed=0)
+		c.is_corrective_job_card = 1
+		c.before_submit()
+		self.assertEqual((c.process_loss_qty, c.pending_qty), (0, 0))
+
+	def test_validate_sets_break_net_and_entry_type(self):
+		rows = [
+			Row(idx=1, from_time="2026-10-27 08:00:00", to_time="2026-10-27 12:00:00", time_in_mins=240),
+			Row(idx=2, from_time="2026-10-27 12:00:00", to_time=None, time_in_mins=0),
+		]
+		c = self.card(rows)
+		c.validate()
+		self.assertIn("standard_validate", self.Base.calls)
+		self.assertEqual((rows[0].break_minutes, rows[0].net_minutes), (30.0, 210.0))
+		self.assertEqual((rows[1].break_minutes, rows[1].net_minutes), (0, 0))
+		self.assertEqual({r.entry_type for r in rows}, {"Normal"})
+		# recorded times are untouched
+		self.assertEqual((rows[0].from_time, rows[0].to_time, rows[0].time_in_mins), ("2026-10-27 08:00:00", "2026-10-27 12:00:00", 240))
+
+	def test_validate_marks_corrective_rows_as_replacement(self):
+		rows = [Row(idx=1, from_time="2026-10-27 08:00:00", to_time="2026-10-27 09:00:00", time_in_mins=60)]
+		c = self.card(rows)
+		c.is_corrective_job_card = 1
+		c.validate()
+		self.assertEqual(rows[0].entry_type, "Replacement")
+
+	def test_validate_refuses_issue_minutes_over_net(self):
+		rows = [
+			Row(idx=1, from_time="2026-10-27 10:00:00", to_time="2026-10-27 11:00:00", time_in_mins=60,
+				issue_reason="Machine problem", issue_minutes=45),
+		]
+		c = self.card(rows)
+		with self.assertRaises(sys.modules["frappe"].ThrowError):
+			c.validate()  # net is 30 (30 of the 60 minutes are break)
+		rows[0].issue_minutes = 30
+		c.validate()
 
 	def test_submit_blocked_while_entry_open(self):
 		rows = [

@@ -12,8 +12,12 @@ Needs a running bench (`bench start`) and three users with the same password:
 		--site mark.local --bench ~/mark-prod-v16 --fits PO-JOB00001 PO-JOB00002 --overbook PO-JOB00003 PO-JOB00004
 
 --fits cards: two workers finish at the same moment with quantities that fit -> both must succeed.
---overbook cards: two workers finish at the same moment with too much -> one succeeds, the other is
-refused with a readable message. Never a raw database error, never more than the card quantity.
+--overbook cards: two workers finish at the same moment with too much good -> one succeeds, the
+other is refused with a readable message. Never a raw database error, never more good than the card
+quantity (scrap does not use up quantity).
+
+Replacement work is checked as worker1 (Shop Floor Worker only) and with two workers starting at
+the same moment on one operation: they must share ONE draft corrective Job Card.
 """
 
 import argparse
@@ -182,6 +186,7 @@ def main():
 		c.check("all test cards offered (incl. later sequence)", all(x in ops for x in cards), list(ops))
 		c.check("no price/rate/cost keys", not any(PRICE.search(k) for o in ops.values() for k in o), "")
 		start_left = ops.get(jc, {}).get("remaining", 0)
+		start_left_good = ops.get(jc, {}).get("good", 0)
 		st, b = w.call("start", employee=WORKER_A, job_card=jc, machine="SFT-WS-CUT")
 		row_a = track(b)
 		c.check("worker1 starts own work", st == 200 and row_a, msg(b))
@@ -192,9 +197,19 @@ def main():
 		c.check("scrap without reason refused", st != 200 and "reason" in msg(b).lower(), msg(b))
 		st, b = w.call("finish", employee=WORKER_A, row_name=row_a, good_qty=start_left + 1)
 		c.check("over remaining refused", st != 200 and "remaining" in msg(b).lower(), msg(b))
-		st, b = w.call("finish", employee=WORKER_A, row_name=row_a, good_qty=1, scrap_qty=1, scrap_reason="Wire break")
+		st, b = w.call("finish", employee=WORKER_A, row_name=row_a, good_qty=0, scrap_qty=0)
+		c.check("0 / 0 without issue reason refused", st != 200 and "issue reason" in msg(b).lower(), msg(b))
+		st, b = w.call("finish", employee=WORKER_A, row_name=row_a, good_qty=1, issue_reason="Machine setup", issue_minutes=600)
+		c.check("issue minutes above net time refused", st != 200 and "break not included" in msg(b).lower(), msg(b))
+		st, b = w.call("get_entry_time", employee=WORKER_A, row_name=row_a)
+		c.check("live entry time for the finish dialog", st == 200 and "net_minutes" in (b.get("message") or {}), msg(b))
+		st, b = w.call("finish", employee=WORKER_A, row_name=row_a, good_qty=1, scrap_qty=start_left + 5, scrap_reason="Wire break")
 		m = b.get("message") or {}
-		c.check("valid finish", st == 200 and m.get("remaining") == start_left - 2, f"{msg(b)} {m}")
+		c.check("valid finish; scrap above remaining allowed and not subtracted", st == 200 and m.get("remaining") == start_left - 1, f"{msg(b)} {m}")
+		st, b = w.call("start", employee=WORKER_A, job_card=jc)
+		row = track(b)
+		st, b = w.call("finish", employee=WORKER_A, row_name=row, good_qty=0, scrap_qty=0, issue_reason="Waiting for materials", issue_note="http check")
+		c.check("0 / 0 with an issue reason is saved", st == 200 and (b.get("message") or {}).get("good") == 0, msg(b))
 
 		print("later operation (Sequence ID 2) as a worker")
 		later = args.fits[1] if len(args.fits) > 1 else None
@@ -204,6 +219,35 @@ def main():
 			c.check(f"worker1 starts {later} before the earlier operation is submitted", st == 200 and row, msg(b))
 			st, b = w.call("finish", employee=WORKER_A, row_name=row, good_qty=1)
 			c.check(f"worker1 finishes {later}", st == 200, msg(b))
+
+		print("replacement work")
+		st, b = w.call("list_replacement_work_orders")
+		wos = [x["work_order"] for x in (b.get("message") or [])]
+		c.check("replacement work orders listed", st == 200 and wos, msg(b))
+		st, b = w.call("list_replacement_operations", work_order=wos[0] if wos else "")
+		ops_r = b.get("message") or []
+		c.check("replacement operations listed, no prices", st == 200 and ops_r and not any(PRICE.search(k) for o in ops_r for k in o), msg(b))
+		st, b = w.call("start_replacement", employee=WORKER_A, job_card=jc)
+		row = track(b)
+		active = (b.get("message") or {}).get("active") or [{}]
+		c.check("worker1 (Shop Floor Worker only) starts replacement", st == 200 and active[0].get("entry_type") == "Replacement", msg(b))
+		st, b = w.call("finish", employee=WORKER_A, row_name=row, good_qty=1)
+		c.check("normal finish refused for replacement", st != 200 and "replacement" in msg(b).lower(), msg(b))
+		st, b = w.call("finish_replacement", employee=WORKER_A, row_name=row, reason="Wire break", note="http check")
+		c.check("worker1 finishes replacement", st == 200, msg(b))
+		r1, r2 = run_together(
+			lambda: sh.call("start_replacement", employee=WORKER_B, job_card=jc),
+			lambda: sh.call("start_replacement", employee=WORKER_C, job_card=jc),
+		)
+		rows = [track(r1[1]), track(r2[1])]
+		cards_r = {((x[1].get("message") or {}).get("job_card")) for x in (r1, r2)}
+		c.check("two replacement starts at the same moment both succeed", r1[0] == r2[0] == 200, [msg(x[1]) for x in (r1, r2)])
+		c.check("... and share ONE corrective Job Card", len(cards_r) == 1, cards_r)
+		for emp, row in zip((WORKER_B, WORKER_C), rows):
+			if row:
+				sh.call("finish_replacement", employee=emp, row_name=row, reason="Other")
+		after = card_totals(sup, jc)
+		c.check("replacement adds no good / scrap to the source card", after and after["good"] == start_left_good + 1, after)
 
 		print("collisions: two workers on one Job Card at the same moment")
 		for card in args.fits + args.overbook:
@@ -240,8 +284,8 @@ def main():
 					sh.call("cancel_start", employee=emp, row_name=row)
 			after = card_totals(sup, card)
 			c.check(
-				f"{card}: good + scrap never above the card quantity",
-				after["good"] + after["scrap"] <= after["required"] + 1e-9 and after["open_entries"] == before["open_entries"],
+				f"{card}: good never above the card quantity",
+				after["good"] <= after["required"] + 1e-9 and after["open_entries"] == before["open_entries"],
 				after,
 			)
 	finally:
@@ -269,6 +313,9 @@ def cleanup(rows):
 		if doc.docstatus != 0:
 			continue
 		doc.set("time_logs", [r for r in doc.time_logs if r.name not in rows])
+		if doc.is_corrective_job_card and not doc.time_logs:
+			frappe.delete_doc("Job Card", name, ignore_permissions=True, force=True)
+			continue
 		employees = {r.employee for r in doc.time_logs}
 		doc.set("employee", [e for e in doc.get("employee") if e.employee in employees])
 		if not doc.time_logs:
