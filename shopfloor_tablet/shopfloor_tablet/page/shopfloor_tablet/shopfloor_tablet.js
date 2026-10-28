@@ -13,11 +13,22 @@
 		return String(v);
 	};
 
+	const mins = (n) => `${Math.floor(Number(n || 0))} min`;
+
 	const pad = (n) => String(n).padStart(2, "0");
 	const clock = (secs) => {
 		secs = Math.max(0, Math.floor(secs));
 		return `${pad(Math.floor(secs / 3600))}:${pad(Math.floor((secs % 3600) / 60))}:${pad(secs % 60)}`;
 	};
+
+	// A response for a worker who is no longer on screen. Callers ignore it silently.
+	class Stale extends Error {
+		constructor() {
+			super("stale response");
+			this.stale = true;
+		}
+	}
+	const is_stale = (e) => !!(e && e.stale);
 
 	const ICON_MACHINE = `<svg class="sft-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`;
 	const ICON_TICK = `<svg class="sft-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" d="M5 12.5l4.5 4.5L19 7.5"/></svg>`;
@@ -44,6 +55,8 @@
 				workers: [],
 				machines: [],
 				reasons: [],
+				issueReasons: [],
+				replacementEnabled: false,
 				active: [],
 				operations: [],
 				search: "",
@@ -54,7 +67,12 @@
 				error: "",
 				loadedAt: Date.now(),
 				finishing: null,
+				mode: "normal", // "normal" | "replacement"
+				repl: { search: "", orders: [], work_order: null, ops: [], selected: null },
 			};
+			// Every request remembers the generation and the worker it was made for. Switching
+			// worker (or logging out) starts a new generation, so late answers are dropped.
+			this.gen = 0;
 			// Work Order -> colour index. Kept for the session so a Work Order keeps its colour
 			// across refreshes and on the active-work card.
 			this.accents = {};
@@ -64,6 +82,7 @@
 			this.searchTimer = null;
 
 			this.bind();
+			this.watch_logout();
 			$(wrapper).on("show", () => this.on_show());
 			setTimeout(() => this.on_show(), 0);
 			setInterval(() => this.tick(), 1000);
@@ -81,6 +100,44 @@
 					error: (r) => reject(new Error(this.error_text(r))),
 				});
 			});
+		}
+
+		// A call made for the current worker. Rejects with Stale when the worker changed meanwhile.
+		request(method, args) {
+			const gen = this.gen;
+			const emp = this.s.employee ? this.s.employee.name : null;
+			const current = () =>
+				gen === this.gen && emp === (this.s.employee ? this.s.employee.name : null);
+			return this.call(method, Object.assign({ employee: emp }, args || {})).then(
+				(data) => {
+					if (!current()) throw new Stale();
+					return data;
+				},
+				(err) => {
+					throw current() ? err : new Stale();
+				}
+			);
+		}
+
+		new_generation() {
+			this.gen++;
+			this.s.busy = false;
+			this.$root.removeClass("sft-busy");
+			clearTimeout(this.searchTimer);
+		}
+
+		watch_logout() {
+			const app = frappe.app;
+			if (!app || app.__sft_wrapped) return;
+			app.__sft_wrapped = true;
+			for (const fn of ["logout", "redirect_to_login"]) {
+				const orig = app[fn];
+				if (typeof orig !== "function") continue;
+				app[fn] = (...a) => {
+					this.new_generation();
+					return orig.apply(app, a);
+				};
+			}
 		}
 
 		error_text(r) {
@@ -133,12 +190,20 @@
 				me.searchTimer = setTimeout(() => me.load_state(true), 350);
 			});
 
+			this.$root.on("input", "[data-role=wo-search]", function () {
+				me.s.repl.search = $(this).val();
+				clearTimeout(me.searchTimer);
+				me.searchTimer = setTimeout(() => me.load_replacement_orders(), 350);
+			});
+
 			this.$root.on("change", "[data-role=machine]", function () {
 				me.s.machine = $(this).val();
 				me.render_summary();
 			});
 
-			this.$root.on("input", "[data-role=good], [data-role=scrap]", () => this.update_finish_hint());
+			this.$root.on("input change", "[data-role=good], [data-role=scrap], [data-role=issue-reason]", () =>
+				this.update_finish_hint()
+			);
 		}
 
 		act(action, $el) {
@@ -147,12 +212,22 @@
 					return this.pick_worker($el.attr("data-emp"));
 				case "change-worker":
 					return this.show_picker();
+				case "mode":
+					return this.set_mode($el.attr("data-mode"));
 				case "select-op":
 					return this.select_op($el.attr("data-jc"));
+				case "pick-wo":
+					return this.pick_replacement_wo($el.attr("data-wo"));
+				case "repl-back":
+					return this.pick_replacement_wo(null);
+				case "select-repl-op":
+					return this.select_repl_op($el.attr("data-jc"));
 				case "pick-machine":
 					return this.pick_machine($el.attr("data-machine"));
 				case "start":
 					return this.start();
+				case "start-replacement":
+					return this.start_replacement();
 				case "finish-open":
 					return this.open_finish($el.attr("data-row"));
 				case "cancel-start":
@@ -181,6 +256,8 @@
 					this.s.workers = ctx.workers || [];
 					this.s.machines = ctx.machines || [];
 					this.s.reasons = ctx.scrap_reasons || [];
+					this.s.issueReasons = ctx.issue_reasons || [];
+					this.s.replacementEnabled = !!ctx.replacement_enabled;
 					this.s.ownEmployee = ctx.employee || null;
 					this.s.ready = true;
 					if (this.s.ownEmployee) {
@@ -220,12 +297,7 @@
 
 			// shared tablet (login not linked to one employee): back to the name list
 			if (!this.s.ownEmployee && this.s.employee && !modal_open && idle > IDLE_SECONDS) {
-				this.s.employee = null;
-				this.s.selected = null;
-				this.s.search = "";
-				this.s.flash = "";
-				this.s.error = "";
-				this.render_picker();
+				this.show_picker();
 				return;
 			}
 
@@ -236,24 +308,30 @@
 				!this.s.busy &&
 				(Date.now() - this.lastRefresh) / 1000 > REFRESH_SECONDS
 			) {
-				this.load_state(true);
+				this.refresh();
 			}
+		}
+
+		refresh() {
+			if (!this.s.active.length && this.s.mode === "replacement") {
+				this.lastRefresh = Date.now();
+				return this.s.repl.work_order ? this.load_replacement_ops(true) : this.load_replacement_orders(true);
+			}
+			return this.load_state(true);
 		}
 
 		async load_state(quiet) {
 			if (!this.s.employee) return;
 			this.lastRefresh = Date.now();
 			try {
-				const st = await this.call("get_state", {
-					employee: this.s.employee.name,
-					search: this.s.search || "",
-				});
+				const st = await this.request("get_state", { search: this.s.search || "" });
 				this.s.active = st.active || [];
 				this.s.operations = st.operations || [];
 				this.s.loadedAt = Date.now();
 				if (this.s.selected && !this.s.operations.find((o) => o.job_card === this.s.selected)) {
 					this.s.selected = null;
 				}
+				if (this.s.active.length) this.s.mode = "normal";
 				if (quiet && this.$root.find(".sft-ops").length && !this.s.active.length) {
 					this.render_ops();
 					this.render_startbar();
@@ -261,6 +339,7 @@
 					this.render_main();
 				}
 			} catch (e) {
+				if (is_stale(e)) return;
 				if (!quiet) {
 					this.s.error = e.message;
 					this.render_main();
@@ -288,23 +367,32 @@
 			`);
 		}
 
-		pick_worker(name) {
-			const w = this.s.workers.find((x) => x.name === name);
-			if (!w) return;
-			this.s.employee = w;
+		reset_worker_view() {
 			this.s.selected = null;
 			this.s.search = "";
 			this.s.flash = "";
 			this.s.error = "";
+			this.s.active = [];
+			this.s.operations = [];
+			this.s.finishing = null;
+			this.s.mode = "normal";
+			this.s.repl = { search: "", orders: [], work_order: null, ops: [], selected: null };
+		}
+
+		pick_worker(name) {
+			const w = this.s.workers.find((x) => x.name === name);
+			if (!w) return;
+			this.new_generation();
+			this.s.employee = w;
+			this.reset_worker_view();
 			this.render_loading();
 			this.load_state(false);
 		}
 
 		show_picker() {
+			this.new_generation();
 			this.s.employee = null;
-			this.s.selected = null;
-			this.s.flash = "";
-			this.s.error = "";
+			this.reset_worker_view();
 			this.render_picker();
 		}
 
@@ -316,13 +404,21 @@
 			if (this.s.active.length) {
 				body = this.s.active.map((a) => this.active_card(a)).join("");
 			} else {
-				body = `
-					<div class="sft-title">Start work</div>
-					<input class="sft-input sft-search" data-role="op-search" type="search"
-						placeholder="Search work order, item or operation" autocomplete="off"
-						value="${esc(this.s.search)}">
-					<div class="sft-ops"></div>
-					<div class="sft-startbar"></div>`;
+				const tabs = this.s.replacementEnabled
+					? `<div class="sft-tabs" role="tablist">
+						<button class="sft-tab${this.s.mode === "normal" ? " sft-on" : ""}" data-action="mode" data-mode="normal">Start work</button>
+						<button class="sft-tab sft-tab-repl${this.s.mode === "replacement" ? " sft-on" : ""}" data-action="mode" data-mode="replacement">Replacement work</button>
+					</div>`
+					: `<div class="sft-title">Start work</div>`;
+				body =
+					this.s.mode === "replacement"
+						? `${tabs}<div class="sft-repl"></div><div class="sft-startbar"></div>`
+						: `${tabs}
+						<input class="sft-input sft-search" data-role="op-search" type="search"
+							placeholder="Search work order, item or operation" autocomplete="off"
+							value="${esc(this.s.search)}">
+						<div class="sft-ops"></div>
+						<div class="sft-startbar"></div>`;
 			}
 
 			this.$root.html(`
@@ -335,7 +431,11 @@
 			`);
 			this.render_banner();
 			if (!this.s.active.length) {
-				this.render_ops();
+				if (this.s.mode === "replacement") {
+					this.render_replacement();
+				} else {
+					this.render_ops();
+				}
 				this.render_startbar();
 			}
 		}
@@ -355,42 +455,46 @@
 			return `<span class="sft-chip sft-chip-machine">${ICON_MACHINE}${esc(machine || "-")}</span>`;
 		}
 
+		// good and left against planned; scrap is shown on its own (it does not use up quantity)
 		progress(o) {
 			const req = Number(o.required) || 0;
 			const pct = (v) => (req > 0 ? Math.max(0, Math.min(100, (Number(v || 0) / req) * 100)) : 0);
+			const scrap = Number(o.scrap) || 0;
 			return `
 				<div class="sft-progress" role="img"
-					aria-label="good ${fmt(o.good)}, scrap ${fmt(o.scrap)}, left ${fmt(o.remaining)} of ${fmt(req)}">
+					aria-label="good ${fmt(o.good)}, left ${fmt(o.remaining)} of ${fmt(req)}">
 					<span class="sft-bar-good" style="width:${pct(o.good)}%"></span>
-					<span class="sft-bar-scrap" style="width:${pct(o.scrap)}%"></span>
 				</div>
 				<div class="sft-progress-legend">
 					<span><i class="sft-dot sft-dot-good"></i>Good ${fmt(o.good)}</span>
-					<span><i class="sft-dot sft-dot-scrap"></i>Scrap ${fmt(o.scrap)}</span>
 					<span><i class="sft-dot sft-dot-left"></i>Left ${fmt(o.remaining)}</span>
+					${scrap > 0 ? `<span class="sft-scrap-note"><i class="sft-dot sft-dot-scrap"></i>Scrap ${fmt(scrap)} (made again)</span>` : ""}
 				</div>`;
 		}
 
 		active_card(a) {
-			const done = Math.max(0, (Number(a.required) || 0) - (Number(a.remaining) || 0));
+			const repl = a.entry_type === "Replacement";
+			const head = `
+				<div class="sft-active-head">
+					<span class="sft-live-dot"></span>
+					<span class="sft-active-label">${repl ? "Replacement work" : "Working now"}</span>
+					<span class="sft-active-wo">${esc(a.work_order)}</span>
+				</div>`;
+			const qty = repl
+				? `<div class="sft-active-left">Replacement work records time only: no good, no scrap.</div>`
+				: `${this.progress(a)}
+					<div class="sft-active-left">Left on this operation: <b>${fmt(a.remaining)}</b> of ${fmt(a.required)} ${esc(a.uom || "")}</div>`;
 			return `
-				<div class="sft-card sft-active ${this.accent(a.work_order)}">
-					<div class="sft-active-head">
-						<span class="sft-live-dot"></span>
-						<span class="sft-active-label">Working now</span>
-						<span class="sft-active-wo">${esc(a.work_order)}</span>
-					</div>
-					<div class="sft-op-title">${esc(a.operation)}</div>
+				<div class="sft-card sft-active ${repl ? "sft-active-repl " : ""}${this.accent(a.work_order)}">
+					${head}
+					<div class="sft-op-title">${repl ? "Replacement: " : ""}${esc(a.operation)}</div>
 					<div class="sft-active-item">${esc(a.item_name)}</div>
 					<div class="sft-chips">
 						${this.machine_chip(a.machine)}
 						<span class="sft-chip">Started ${esc(a.started_at)}</span>
 					</div>
 					<div class="sft-timer" data-elapsed="${a.elapsed_seconds}">${clock(a.elapsed_seconds)}</div>
-					<div class="sft-progress" role="img" aria-label="done ${fmt(done)}, left ${fmt(a.remaining)} of ${fmt(a.required)}">
-						<span class="sft-bar-done" style="width:${a.required > 0 ? Math.min(100, (done / a.required) * 100) : 0}%"></span>
-					</div>
-					<div class="sft-active-left">Left on this operation: <b>${fmt(a.remaining)}</b> of ${fmt(a.required)} ${esc(a.uom || "")}</div>
+					${qty}
 					<button class="sft-btn sft-btn-finish" data-action="finish-open" data-row="${esc(a.row_name)}">FINISH</button>
 					<button class="sft-btn sft-btn-link" data-action="cancel-start" data-row="${esc(a.row_name)}">Started by mistake - cancel</button>
 				</div>`;
@@ -485,15 +589,24 @@
 			return machines;
 		}
 
+		// the operation the start bar is for, in the current mode
+		chosen_op() {
+			if (this.s.mode === "replacement") {
+				return this.s.repl.ops.find((o) => o.job_card === this.s.repl.selected);
+			}
+			return this.s.operations.find((o) => o.job_card === this.s.selected);
+		}
+
 		render_startbar() {
 			const $bar = this.$root.find(".sft-startbar");
 			if (!$bar.length) return;
 
-			const op = this.s.operations.find((o) => o.job_card === this.s.selected);
+			const op = this.chosen_op();
 			if (!op) {
 				$bar.empty();
 				return;
 			}
+			const repl = this.s.mode === "replacement";
 
 			const machines = this.machine_options(op);
 			let picker;
@@ -522,39 +635,185 @@
 				picker = `<select class="sft-input sft-select" data-role="machine">${options}</select>`;
 			}
 
-			$bar.attr("class", `sft-startbar ${this.accent(op.work_order)}`).html(`
+			$bar.attr("class", `sft-startbar ${repl ? "sft-startbar-repl " : ""}${this.accent(op.work_order)}`).html(`
 				<div class="sft-label">Machine</div>
 				${picker}
 				<div class="sft-summary"></div>
-				<button class="sft-btn sft-btn-start" data-action="start">START</button>
+				${
+					repl
+						? '<button class="sft-btn sft-btn-start sft-btn-repl" data-action="start-replacement">START REPLACEMENT</button>'
+						: '<button class="sft-btn sft-btn-start" data-action="start">START</button>'
+				}
 			`);
 			this.render_summary();
 		}
 
 		render_summary() {
-			const op = this.s.operations.find((o) => o.job_card === this.s.selected);
+			const op = this.chosen_op();
 			if (!op) return;
 			const machine = this.s.machine
 				? esc(this.s.machine)
 				: '<span class="sft-summary-missing">choose a machine</span>';
+			const prefix = this.s.mode === "replacement" ? "Replacement work &middot; " : "";
 			this.$root
 				.find(".sft-summary")
 				.html(
-					`<b>${esc(op.work_order)}</b> &middot; ${esc(op.item_name)} &middot; <b>${esc(op.operation)}</b> &middot; ${machine}`
+					`${prefix}<b>${esc(op.work_order)}</b> &middot; ${esc(op.item_name)} &middot; <b>${esc(op.operation)}</b> &middot; ${machine}`
 				);
+		}
+
+		// ------------------------------------------------------------ replacement mode
+		set_mode(mode) {
+			if (mode === this.s.mode) return;
+			this.s.mode = mode === "replacement" ? "replacement" : "normal";
+			this.s.selected = null;
+			this.s.repl.selected = null;
+			this.s.error = "";
+			this.s.flash = "";
+			this.render_main();
+			if (this.s.mode === "replacement" && !this.s.repl.work_order) this.load_replacement_orders();
+			if (this.s.mode === "normal") this.load_state(true);
+		}
+
+		async load_replacement_orders(quiet) {
+			if (!this.s.employee) return;
+			try {
+				this.s.repl.orders = await this.request("list_replacement_work_orders", {
+					search: this.s.repl.search || "",
+				});
+				this.render_replacement();
+			} catch (e) {
+				if (is_stale(e) || quiet) return;
+				this.s.error = e.message;
+				this.render_banner();
+			}
+		}
+
+		async load_replacement_ops(quiet) {
+			const wo = this.s.repl.work_order;
+			if (!this.s.employee || !wo) return;
+			try {
+				const ops = await this.request("list_replacement_operations", { work_order: wo });
+				if (this.s.repl.work_order !== wo) return;
+				this.s.repl.ops = ops || [];
+				if (this.s.repl.selected && !this.s.repl.ops.find((o) => o.job_card === this.s.repl.selected)) {
+					this.s.repl.selected = null;
+				}
+				this.render_replacement();
+				this.render_startbar();
+			} catch (e) {
+				if (is_stale(e) || quiet) return;
+				this.s.error = e.message;
+				this.render_banner();
+			}
+		}
+
+		pick_replacement_wo(wo) {
+			this.s.repl.work_order = wo || null;
+			this.s.repl.ops = [];
+			this.s.repl.selected = null;
+			this.render_replacement();
+			this.render_startbar();
+			if (wo) this.load_replacement_ops();
+			else this.load_replacement_orders();
+		}
+
+		render_replacement() {
+			const $r = this.$root.find(".sft-repl");
+			if (!$r.length) return;
+			const r = this.s.repl;
+
+			if (!r.work_order) {
+				const list = r.orders.length
+					? r.orders
+							.map(
+								(o) => `
+						<div class="sft-card sft-wo-pick ${this.accent(o.work_order)}" data-action="pick-wo" data-wo="${esc(o.work_order)}">
+							<div class="sft-wo-no">${esc(o.work_order)}</div>
+							<div class="sft-wo-item">${esc(o.item_name)}</div>
+							<div class="sft-chips"><span class="sft-chip">${esc(o.status)}</span>
+								<span class="sft-chip">${fmt(o.qty)} ${esc(o.uom || "")}</span></div>
+						</div>`
+							)
+							.join("")
+					: '<div class="sft-empty">No work orders found.</div>';
+				$r.html(`
+					<div class="sft-repl-help">Time spent redoing work on an earlier operation. It does not count as good or scrap.</div>
+					<input class="sft-input sft-search" data-role="wo-search" type="search"
+						placeholder="Search work order or item" autocomplete="off" value="${esc(r.search)}">
+					<div class="sft-label">1. Choose the work order</div>
+					${list}`);
+				return;
+			}
+
+			const ops = r.ops.length
+				? r.ops
+						.map((o, i) => {
+							const sel = r.selected === o.job_card ? " sft-selected" : "";
+							return `
+						<div class="sft-card sft-op${sel}" data-action="select-repl-op" data-jc="${esc(o.job_card)}">
+							<div class="sft-step">${o.sequence_id || i + 1}</div>
+							<div class="sft-op-main">
+								<div class="sft-op-title">${esc(o.operation)}</div>
+								<div class="sft-chips">${this.machine_chip(o.machine)}
+									<span class="sft-chip">${o.submitted ? "Completed" : esc(o.status || "Open")}</span></div>
+							</div>
+							<div class="sft-op-qty">
+								<div class="sft-qty-big">${fmt(o.good)}</div>
+								<div class="sft-op-sub">good of ${fmt(o.required)} ${esc(o.uom || "")}</div>
+							</div>
+							<div class="sft-tick">${ICON_TICK}</div>
+						</div>`;
+						})
+						.join("")
+				: '<div class="sft-empty">Loading operations...</div>';
+			$r.html(`
+				<div class="sft-repl-wo ${this.accent(r.work_order)}">
+					<div><div class="sft-wo-no">${esc(r.work_order)}</div>
+						<div class="sft-wo-item">${esc((r.orders.find((o) => o.work_order === r.work_order) || {}).item_name || "")}</div></div>
+					<button class="sft-btn sft-btn-ghost" data-action="repl-back">Other work order</button>
+				</div>
+				<div class="sft-label">2. Choose the operation to redo</div>
+				<div class="sft-ops${r.selected ? " sft-has-selection" : ""}">${ops}</div>`);
+		}
+
+		select_repl_op(jc) {
+			const op = this.s.repl.ops.find((o) => o.job_card === jc);
+			if (!op) return;
+			this.s.repl.selected = jc;
+			this.s.machine = op.machine || "";
+			this.s.error = "";
+			this.render_banner();
+			this.render_replacement();
+			this.render_startbar();
 		}
 
 		// ------------------------------------------------------------ actions
 		async run(fn) {
 			if (this.s.busy) return;
+			const gen = this.gen;
 			this.s.busy = true;
 			this.$root.addClass("sft-busy");
 			try {
 				await fn();
 			} finally {
-				this.s.busy = false;
-				this.$root.removeClass("sft-busy");
+				// a newer generation already reset the busy state
+				if (gen === this.gen) {
+					this.s.busy = false;
+					this.$root.removeClass("sft-busy");
+				}
 			}
+		}
+
+		after_start(r, flash) {
+			this.s.active = r.active || [];
+			this.s.selected = null;
+			this.s.repl.selected = null;
+			this.s.mode = "normal";
+			this.s.loadedAt = Date.now();
+			this.s.error = "";
+			this.s.flash = flash;
+			this.render_main();
 		}
 
 		start() {
@@ -566,21 +825,35 @@
 			}
 			return this.run(async () => {
 				try {
-					const r = await this.call("start", {
-						employee: this.s.employee.name,
-						job_card: op.job_card,
-						machine: this.s.machine,
-					});
-					this.s.active = r.active || [];
-					this.s.selected = null;
-					this.s.loadedAt = Date.now();
-					this.s.error = "";
-					this.s.flash = "Started. The time is running.";
-					this.render_main();
+					const r = await this.request("start", { job_card: op.job_card, machine: this.s.machine });
+					this.after_start(r, "Started. The time is running.");
 				} catch (e) {
+					if (is_stale(e)) return;
 					this.s.error = e.message;
 					this.render_banner();
 					this.load_state(true);
+				}
+			});
+		}
+
+		start_replacement() {
+			const op = this.chosen_op();
+			if (!op || this.s.mode !== "replacement") return;
+			if (!this.s.machine) {
+				this.s.error = "Choose a machine.";
+				return this.render_banner();
+			}
+			return this.run(async () => {
+				try {
+					const r = await this.request("start_replacement", {
+						job_card: op.job_card,
+						machine: this.s.machine,
+					});
+					this.after_start(r, "Replacement work started. The time is running.");
+				} catch (e) {
+					if (is_stale(e)) return;
+					this.s.error = e.message;
+					this.render_banner();
 				}
 			});
 		}
@@ -589,15 +862,13 @@
 			frappe.confirm("Cancel this start? Nothing will be recorded.", () =>
 				this.run(async () => {
 					try {
-						const r = await this.call("cancel_start", {
-							employee: this.s.employee.name,
-							row_name: row,
-						});
+						const r = await this.request("cancel_start", { row_name: row });
 						this.s.active = r.active || [];
 						this.s.flash = "Start cancelled.";
 						this.s.error = "";
 						await this.load_state(false);
 					} catch (e) {
+						if (is_stale(e)) return;
 						this.s.error = e.message;
 						this.render_banner();
 					}
@@ -605,42 +876,66 @@
 			);
 		}
 
+		options(list, blank) {
+			return [`<option value="">${esc(blank)}</option>`]
+				.concat(list.map((r) => `<option value="${esc(r)}">${esc(r)}</option>`))
+				.join("");
+		}
+
 		open_finish(row) {
 			const a = this.s.active.find((x) => x.row_name === row);
 			if (!a) return;
 			this.s.finishing = a;
+			const repl = a.entry_type === "Replacement";
+			// net working time so far: refreshed from the server below
+			a.net_now = Number(a.net_minutes || 0) + (Date.now() - this.s.loadedAt) / 60000;
 
-			const reasons = ['<option value="">Choose reason</option>']
-				.concat(this.s.reasons.map((r) => `<option value="${esc(r)}">${esc(r)}</option>`))
-				.join("");
+			const qty_fields = repl
+				? `<label class="sft-label">Reason for the replacement</label>
+					<select class="sft-input sft-select" data-role="repl-reason">${this.options(this.s.reasons, "Choose reason")}</select>
+					<label class="sft-label">Note (optional)</label>
+					<textarea class="sft-input sft-note" data-role="note" rows="2" maxlength="500"></textarea>`
+				: `<label class="sft-label">Good quantity</label>
+					<input class="sft-input sft-qtyinput" data-role="good" type="number" inputmode="decimal"
+						min="0" step="any" placeholder="0">
+					<button class="sft-btn sft-btn-ghost sft-small" data-action="all-remaining">All remaining is good</button>
+
+					<label class="sft-label">Scrap quantity</label>
+					<input class="sft-input sft-qtyinput sft-qty-scrap" data-role="scrap" type="number" inputmode="decimal"
+						min="0" step="any" placeholder="0">
+
+					<div class="sft-reason sft-hidden">
+						<label class="sft-label">Scrap reason</label>
+						<select class="sft-input sft-select" data-role="reason">${this.options(this.s.reasons, "Choose reason")}</select>
+					</div>
+
+					<div class="sft-hint"></div>
+
+					<details class="sft-issue">
+						<summary>Problem during this work? (optional)</summary>
+						<label class="sft-label">Issue</label>
+						<select class="sft-input sft-select" data-role="issue-reason">${this.options(this.s.issueReasons, "No issue")}</select>
+						<label class="sft-label">Minutes lost (optional, at most <span class="sft-net-max">${mins(a.net_now)}</span>)</label>
+						<input class="sft-input" data-role="issue-minutes" type="number" inputmode="decimal" min="0" step="any" placeholder="0">
+						<label class="sft-label">Note (optional)</label>
+						<textarea class="sft-input sft-note" data-role="note" rows="2" maxlength="500"></textarea>
+					</details>`;
 
 			this.$root.find(".sft-modal").remove();
 			this.$root.append(`
 				<div class="sft-modal">
-					<div class="sft-modal-box ${this.accent(a.work_order)}">
-						<div class="sft-title">Finish work</div>
+					<div class="sft-modal-box ${repl ? "sft-modal-repl " : ""}${this.accent(a.work_order)}">
+						<div class="sft-title">${repl ? "Finish replacement work" : "Finish work"}</div>
 						<div class="sft-modal-summary">
 							<div class="sft-op-title">${esc(a.operation)}</div>
 							<div class="sft-op-sub"><b>${esc(a.work_order)}</b> &middot; ${esc(a.item_name)}</div>
 							<div class="sft-chips">${this.machine_chip(a.machine)}</div>
-							<div class="sft-modal-left">Left on this operation: <b>${fmt(a.remaining)}</b> ${esc(a.uom || "")}</div>
+							<div class="sft-modal-left">Working time without break: <b class="sft-net-now">${mins(a.net_now)}</b></div>
+							${repl ? "" : `<div class="sft-modal-left">Left on this operation: <b>${fmt(a.remaining)}</b> ${esc(a.uom || "")}</div>`}
 						</div>
 
-						<label class="sft-label">Good quantity</label>
-						<input class="sft-input sft-qtyinput" data-role="good" type="number" inputmode="decimal"
-							min="0" step="any" placeholder="0">
-						<button class="sft-btn sft-btn-ghost sft-small" data-action="all-remaining">All remaining is good</button>
+						${qty_fields}
 
-						<label class="sft-label">Scrap quantity</label>
-						<input class="sft-input sft-qtyinput sft-qty-scrap" data-role="scrap" type="number" inputmode="decimal"
-							min="0" step="any" placeholder="0">
-
-						<div class="sft-reason sft-hidden">
-							<label class="sft-label">Scrap reason</label>
-							<select class="sft-input sft-select" data-role="reason">${reasons}</select>
-						</div>
-
-						<div class="sft-hint"></div>
 						<div class="sft-modal-error"></div>
 
 						<div class="sft-modal-buttons">
@@ -649,7 +944,19 @@
 						</div>
 					</div>
 				</div>`);
-			this.$root.find("[data-role=good]").trigger("focus");
+			this.$root.find(repl ? "[data-role=repl-reason]" : "[data-role=good]").trigger("focus");
+			this.load_entry_time(a);
+		}
+
+		async load_entry_time(a) {
+			try {
+				const t = await this.request("get_entry_time", { row_name: a.row_name });
+				if (this.s.finishing !== a) return;
+				a.net_now = Number(t.net_minutes) || 0;
+				this.$root.find(".sft-net-now, .sft-net-max").text(mins(a.net_now));
+			} catch (e) {
+				// the estimate stays; the server checks the limit at Finish anyway
+			}
 		}
 
 		close_finish() {
@@ -660,7 +967,6 @@
 		fill_all_remaining() {
 			if (!this.s.finishing) return;
 			this.$root.find("[data-role=good]").val(fmt(this.s.finishing.remaining));
-			this.$root.find("[data-role=scrap]").val("");
 			this.update_finish_hint();
 		}
 
@@ -669,26 +975,49 @@
 				const v = parseFloat(String(this.$root.find(sel).val() || "").replace(",", "."));
 				return isNaN(v) ? 0 : v;
 			};
+			const txt = (sel) => String(this.$root.find(sel).val() || "").trim();
 			return {
 				good: num("[data-role=good]"),
 				scrap: num("[data-role=scrap]"),
-				reason: this.$root.find("[data-role=reason]").val() || "",
+				reason: txt("[data-role=reason]"),
+				issue: txt("[data-role=issue-reason]"),
+				issue_minutes: num("[data-role=issue-minutes]"),
+				note: txt("[data-role=note]"),
+				repl_reason: txt("[data-role=repl-reason]"),
 			};
 		}
 
 		update_finish_hint() {
 			const a = this.s.finishing;
-			if (!a) return;
+			if (!a || a.entry_type === "Replacement") return;
 			const v = this.finish_values();
 			this.$root.find(".sft-reason").toggleClass("sft-hidden", !(v.scrap > 0));
-			const total = Math.round((v.good + v.scrap) * 1000) / 1000;
-			const left = Math.round((a.remaining - total) * 1000) / 1000;
+			const left = Math.round((a.remaining - v.good) * 1000) / 1000;
 			const $h = this.$root.find(".sft-hint");
 			if (left < 0) {
-				$h.addClass("sft-hint-bad").text(`More than the ${fmt(a.remaining)} left on this operation.`);
+				$h.addClass("sft-hint-bad").text(`Good is more than the ${fmt(a.remaining)} left on this operation.`);
 			} else {
 				$h.removeClass("sft-hint-bad").text(`After this: ${fmt(left)} left.`);
 			}
+		}
+
+		finish_error(v, a) {
+			if (a.entry_type === "Replacement") {
+				return v.repl_reason ? "" : "Choose a reason for the replacement work.";
+			}
+			if (v.good < 0 || v.scrap < 0 || v.issue_minutes < 0) return "Numbers cannot be negative.";
+			if (v.good <= 0 && v.scrap <= 0 && !v.issue) {
+				return "Enter the good quantity or the scrap quantity, or choose an issue reason.";
+			}
+			if (v.scrap > 0 && !v.reason) return "Choose a scrap reason.";
+			if (Math.round(v.good * 1000) > Math.round(a.remaining * 1000)) {
+				return `Good is more than the ${fmt(a.remaining)} left on this operation.`;
+			}
+			if (v.issue_minutes > 0 && !v.issue) return "Choose an issue reason for the minutes lost.";
+			if (v.issue_minutes > Math.ceil(a.net_now || 0)) {
+				return `Minutes lost cannot be more than the working time (${mins(a.net_now)}).`;
+			}
+			return "";
 		}
 
 		submit_finish() {
@@ -696,34 +1025,47 @@
 			if (!a) return;
 			const v = this.finish_values();
 			const $err = this.$root.find(".sft-modal-error");
-			$err.text("");
+			const problem = this.finish_error(v, a);
+			$err.text(problem);
+			if (problem) return;
 
-			if (v.good < 0 || v.scrap < 0) return $err.text("Quantities cannot be negative.");
-			if (v.good <= 0 && v.scrap <= 0) return $err.text("Enter the good quantity or the scrap quantity.");
-			if (v.scrap > 0 && !v.reason) return $err.text("Choose a scrap reason.");
-			if (Math.round((v.good + v.scrap) * 1000) > Math.round(a.remaining * 1000)) {
-				return $err.text(`More than the ${fmt(a.remaining)} left on this operation.`);
-			}
-
+			const repl = a.entry_type === "Replacement";
 			return this.run(async () => {
 				try {
-					const r = await this.call("finish", {
-						employee: this.s.employee.name,
-						row_name: a.row_name,
-						good_qty: v.good,
-						scrap_qty: v.scrap,
-						scrap_reason: v.scrap > 0 ? v.reason : "",
-					});
+					let flash;
+					if (repl) {
+						const r = await this.request("finish_replacement", {
+							row_name: a.row_name,
+							reason: v.repl_reason,
+							note: v.note,
+						});
+						flash = `Replacement work saved: ${fmt(r.net_minutes)} min without break.`;
+					} else {
+						const r = await this.request("finish", {
+							row_name: a.row_name,
+							good_qty: v.good,
+							scrap_qty: v.scrap,
+							scrap_reason: v.scrap > 0 ? v.reason : "",
+							issue_reason: v.issue,
+							issue_minutes: v.issue ? v.issue_minutes : 0,
+							issue_note: v.note,
+						});
+						flash =
+							`Saved: good ${fmt(r.good)}, scrap ${fmt(r.scrap)}, ` +
+							`${fmt(r.net_minutes)} min without break. ${fmt(r.remaining)} left on the operation.`;
+					}
 					this.close_finish();
 					this.s.error = "";
-					this.s.flash =
-						`Saved: good ${fmt(r.good)}, scrap ${fmt(r.scrap)}, ` +
-						`${fmt(r.minutes)} min. ${fmt(r.remaining)} left on the operation.`;
+					this.s.flash = flash;
 					await this.load_state(false);
 				} catch (e) {
+					if (is_stale(e)) return;
 					$err.text(e.message);
 				}
 			});
 		}
 	}
+
+	// exposed for the Node test harness (tests/js/generation.test.js)
+	frappe.pages[PAGE].ShopfloorTablet = ShopfloorTablet;
 })();

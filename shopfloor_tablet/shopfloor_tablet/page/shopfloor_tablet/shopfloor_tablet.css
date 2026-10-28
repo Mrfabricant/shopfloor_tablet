@@ -16,6 +16,8 @@
 	--sft-green-tint: rgba(30, 142, 62, 0.12);
 	--sft-red: #c92a2a;
 	--sft-scrap: #e8590c;
+	--sft-repl: #5a5fa8;
+	--sft-repl-tint: rgba(90, 95, 168, 0.1);
 	--acc: #3b6ea5;
 	--acc-tint: rgba(59, 110, 165, 0.07);
 
@@ -258,6 +260,41 @@
 .sft-modal-error { color: var(--sft-red); font-weight: 700; font-size: 18px; min-height: 24px; margin-top: 4px; }
 .sft-modal-buttons { display: grid; grid-template-columns: 1fr 2fr; gap: 10px; margin-top: 8px; }
 .sft-modal-buttons .sft-btn-finish { margin-top: 0; min-height: 80px; }
+
+/* mode tabs: normal work / replacement work */
+.sft-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 6px 0 12px; }
+.sft-tab {
+	min-height: 60px; border-radius: 12px; border: 2px solid var(--sft-border); background: var(--sft-card);
+	color: var(--sft-text); font-size: 20px; font-weight: 700; cursor: pointer;
+}
+.sft-tab.sft-on { border-color: var(--sft-green); background: var(--sft-green-tint); }
+.sft-tab-repl.sft-on { border-color: var(--sft-repl); background: var(--sft-repl-tint); color: var(--sft-text); }
+
+/* replacement work */
+.sft-repl-help {
+	padding: 10px 14px; border-radius: 12px; margin-bottom: 10px; font-size: 17px;
+	background: var(--sft-repl-tint); border-left: 6px solid var(--sft-repl);
+}
+.sft-wo-pick { cursor: pointer; border-left: 8px solid var(--acc); }
+.sft-wo-pick:active { background: var(--acc-tint); }
+.sft-repl-wo {
+	display: flex; align-items: center; justify-content: space-between; gap: 12px;
+	border-left: 8px solid var(--acc); background: var(--acc-tint); border-radius: 14px; padding: 10px 12px;
+}
+.sft-repl-wo .sft-btn { width: auto; min-height: 52px; font-size: 17px; flex: none; }
+.sft-active-repl { border-color: var(--sft-repl); background: var(--sft-repl-tint); }
+.sft-active-repl .sft-active-label { color: var(--sft-repl); }
+.sft-btn-repl { background: var(--sft-repl); }
+.sft-startbar-repl { border-top-color: var(--sft-repl); }
+.sft-modal-repl { border-top-color: var(--sft-repl); }
+
+/* scrap is shown next to the bar, not inside it */
+.sft-scrap-note { color: var(--sft-scrap); font-weight: 600; }
+
+/* optional issue section in the finish dialog */
+.sft-issue { margin-top: 14px; border: 2px dashed var(--sft-border); border-radius: 12px; padding: 4px 12px 12px; }
+.sft-issue summary { min-height: 52px; display: flex; align-items: center; font-size: 18px; font-weight: 700; cursor: pointer; }
+.sft-note { min-height: 72px; font-size: 18px; resize: vertical; }
 
 @media (max-width: 600px) {
 	.sft-root { padding: 8px 8px 140px; }
