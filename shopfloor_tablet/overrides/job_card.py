@@ -3,9 +3,11 @@ from frappe import _
 from frappe.utils import flt, get_datetime
 from erpnext.manufacturing.doctype.job_card.job_card import JobCard
 
+from shopfloor_tablet import utils
+
 
 class ShopfloorJobCard(JobCard):
-	"""Job Card with four small adjustments for rows entered on the shopfloor tablet.
+	"""Job Card with small adjustments for rows entered on the shopfloor tablet.
 
 	Rows created by the tablet carry ``from_tablet = 1``. Everything else about the Job Card
 	(costing, Work Order update, status) stays standard ERPNext.
@@ -18,6 +20,34 @@ class ShopfloorJobCard(JobCard):
 		"""The stored version of this card (before the current save) has tablet rows."""
 		before = self.get_doc_before_save()
 		return bool(before and any(row.get("from_tablet") for row in (before.get("time_logs") or [])))
+
+	# 0. Break / net minutes, entry type, issue (all rows, tablet and desk) ------------------
+	def validate(self):
+		super().validate()
+		self.set_shopfloor_row_values()
+
+	def set_shopfloor_row_values(self):
+		"""Runs after ERPNext has calculated time_in_mins. Recorded times are never changed."""
+		from shopfloor_tablet.settings import break_config
+
+		cfg = None
+		entry_type = "Replacement" if self.is_corrective_job_card else "Normal"
+		for row in self.get("time_logs") or []:
+			row.entry_type = entry_type
+			if not (row.from_time and row.to_time):
+				row.break_minutes = 0
+				row.net_minutes = 0
+				continue
+
+			cfg = cfg or break_config()
+			brk = utils.break_minutes(get_datetime(row.from_time), get_datetime(row.to_time), *cfg)
+			row.break_minutes = brk
+			row.net_minutes = utils.net_minutes(row.time_in_mins, brk)
+
+			try:
+				utils.check_issue(row.get("issue_reason"), row.get("issue_minutes"), row.net_minutes)
+			except utils.QtyError as exc:
+				frappe.throw(_("Row {0}: {1}").format(row.idx, str(exc)), title=_("Issue minutes"))
 
 	# 1. Machine overlap -------------------------------------------------------------
 	def validate_overlap_in_time_log(self, d):
@@ -50,14 +80,12 @@ class ShopfloorJobCard(JobCard):
 	def set_process_loss(self):
 		"""ERPNext sets process loss to "quantity - completed - pending" on every draft save,
 		which would count work that is simply not done yet as scrap. For cards worked on the tablet
-		the process loss is the scrap the workers actually reported."""
+		scrap lives in the time-log rows (scrap_qty) and the reports; scrapped pieces are made
+		again, so they are not process loss of the operation."""
 		if not self._tablet_rows():
 			return super().set_process_loss()
 
-		self.process_loss_qty = flt(
-			sum(flt(row.get("scrap_qty")) for row in self.get("time_logs")),
-			self.precision("process_loss_qty"),
-		)
+		self.process_loss_qty = 0
 
 	# 3. Submit ----------------------------------------------------------------------
 	def before_submit(self):
@@ -81,15 +109,10 @@ class ShopfloorJobCard(JobCard):
 			)
 
 		# ERPNext requires completed + process loss + pending == quantity at submit.
-		# Quantity nobody worked on goes to "pending" (carried to a new Job Card), not to scrap.
+		# Quantity not made as good goes to "pending" (carried to a new Job Card), not to scrap.
 		precision = self.precision("pending_qty")
-		self.process_loss_qty = flt(
-			sum(flt(row.get("scrap_qty")) for row in self.get("time_logs")), precision
-		)
+		self.process_loss_qty = 0
 		self.pending_qty = max(
-			flt(
-				flt(self.for_quantity) - flt(self.total_completed_qty) - flt(self.process_loss_qty),
-				precision,
-			),
+			flt(flt(self.for_quantity) - flt(self.total_completed_qty), precision),
 			0.0,
 		)

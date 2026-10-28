@@ -22,12 +22,21 @@ frappe.query_reports["Worker Time Entries"] = {
 			fieldtype: "Select",
 			options: "\nOpen\nFinished",
 		},
+		{
+			fieldname: "entry_type",
+			label: __("Entry Type"),
+			fieldtype: "Select",
+			options: "\nNormal\nReplacement",
+		},
 	],
 
 	formatter(value, row, column, data, default_formatter) {
 		value = default_formatter(value, row, column, data);
 		if (data && data.entry_status === "Open" && column.fieldname === "entry_status") {
 			value = `<span style="color:#b45309;font-weight:700">${value}</span>`;
+		}
+		if (data && data.entry_type === "Replacement" && column.fieldname === "entry_type") {
+			value = `<span style="color:#5a5fa8;font-weight:700">${value}</span>`;
 		}
 		return value;
 	},

@@ -12,6 +12,7 @@ from frappe import _
 from frappe.utils import cint, flt, get_datetime, now_datetime, time_diff_in_seconds
 
 from shopfloor_tablet import utils
+from shopfloor_tablet.settings import break_config, get_settings, times_for
 
 ALLOWED_ROLES = {"Shop Floor Worker", "Manufacturing User", "Manufacturing Manager", "System Manager"}
 
@@ -20,6 +21,10 @@ SUPERVISOR_ROLES = {"Manufacturing User", "Manufacturing Manager", "System Manag
 
 # Work Orders in these states are not offered on the tablet
 HIDDEN_WORK_ORDER_STATUS = {"Draft", "Stopped", "Closed", "Completed", "Cancelled"}
+
+# Replacement work is also allowed on finished Work Orders. "Not Started" is included because a
+# Work Order with skipped material transfer stays there until the first Manufacture entry.
+REPLACEMENT_WORK_ORDER_STATUS = {"Not Started", "In Process", "Completed"}
 
 CONFLICT_ERRORS = (frappe.QueryDeadlockError, frappe.TimestampMismatchError)
 CONFLICT_TEXTS = ("Record has changed since last read", "Deadlock found")
@@ -98,20 +103,17 @@ def _get_active_employee(employee, lock=False):
 	return emp
 
 
-def _closed_totals(doc, exclude_row=None):
-	"""Good and scrap quantity of finished entries on a loaded Job Card."""
-	good = scrap = 0.0
-	for row in doc.get("time_logs") or []:
-		if row.to_time and row.name != exclude_row:
-			good += flt(row.completed_qty)
-			scrap += flt(row.get("scrap_qty"))
-	return good, scrap
+def _closed_good(doc, exclude_row=None):
+	"""Good quantity of finished entries on a loaded Job Card (scrap does not use up quantity)."""
+	return sum(flt(row.completed_qty) for row in doc.get("time_logs") or [] if row.to_time and row.name != exclude_row)
 
 
 def _check_job_card_open(doc):
 	if doc.docstatus != 0:
 		frappe.throw(_("This Job Card is already submitted or cancelled."))
-	if doc.is_corrective_job_card or doc.is_subcontracted:
+	if doc.is_corrective_job_card:
+		frappe.throw(_("This is replacement work. Use Replacement work on the tablet."))
+	if doc.is_subcontracted:
 		frappe.throw(_("This operation cannot be recorded on the tablet."))
 	if doc.is_paused:
 		frappe.throw(_("This Job Card is On Hold. Ask your supervisor."))
@@ -150,7 +152,8 @@ def _open_entries(employee):
 		"""
 		select tl.name as row_name, tl.parent as job_card, tl.from_time, tl.workstation as machine,
 			jc.work_order, jc.operation, jc.production_item, jc.item_name, jc.for_quantity,
-			jc.workstation as default_machine, jc.stock_uom
+			jc.workstation as default_machine, jc.stock_uom, jc.is_corrective_job_card,
+			jc.for_operation, jc.for_job_card
 		from `tabJob Card Time Log` tl
 		inner join `tabJob Card` jc on jc.name = tl.parent
 		where tl.parenttype = 'Job Card' and tl.parentfield = 'time_logs' and tl.employee = %(employee)s
@@ -165,15 +168,20 @@ def _open_entries(employee):
 
 	progress = _progress({r.job_card for r in rows})
 	now = now_datetime()
+	cfg = break_config()
 	entries = []
 	for r in rows:
 		p = progress.get(r.job_card, {})
+		_mins, brk, net = times_for(r.from_time, now, cfg=cfg)
+		replacement = bool(r.is_corrective_job_card)
 		entries.append(
 			{
 				"row_name": r.row_name,
 				"job_card": r.job_card,
+				"entry_type": "Replacement" if replacement else "Normal",
+				"for_job_card": r.for_job_card if replacement else None,
 				"work_order": r.work_order,
-				"operation": r.operation,
+				"operation": (r.for_operation or r.operation) if replacement else r.operation,
 				"item_code": r.production_item,
 				"item_name": r.item_name or r.production_item,
 				"uom": r.stock_uom,
@@ -181,11 +189,39 @@ def _open_entries(employee):
 				"started_at": get_datetime(r.from_time).strftime("%H:%M"),
 				"started_date": get_datetime(r.from_time).strftime("%Y-%m-%d"),
 				"elapsed_seconds": max(int(time_diff_in_seconds(now, r.from_time)), 0),
+				"break_minutes": brk,
+				"net_minutes": net,
 				"required": flt(r.for_quantity),
-				"remaining": utils.remaining_qty(r.for_quantity, p.get("good"), p.get("scrap")),
+				"good": flt(p.get("good")),
+				"scrap": flt(p.get("scrap")),
+				"remaining": utils.remaining_qty(r.for_quantity, p.get("good")),
 			}
 		)
 	return entries
+
+
+def _scrap_reasons():
+	return frappe.get_all(
+		"Scrap Reason", filters={"disabled": 0}, pluck="name", order_by="name asc", limit_page_length=0
+	)
+
+
+def _check_scrap_reason(reason):
+	if not frappe.db.exists("Scrap Reason", {"name": reason, "disabled": 0}):
+		frappe.throw(_("Reason {0} is not available.").format(reason))
+
+
+def _load_own_open_row(employee, row_name):
+	"""The worker's open row, on its Job Card loaded with a row lock."""
+	job_card = _fetch_own_open_row(employee, row_name)
+	doc = frappe.get_doc("Job Card", job_card, for_update=True)
+	if doc.docstatus != 0:
+		frappe.throw(_("This Job Card is already submitted or cancelled."))
+
+	row = next((r for r in doc.time_logs if r.name == row_name), None)
+	if not row or row.to_time:
+		frappe.throw(_("This entry is already finished."))
+	return doc, row
 
 
 def _fetch_own_open_row(employee, row_name):
@@ -230,13 +266,9 @@ def get_context():
 			order_by="name asc",
 			limit_page_length=0,
 		),
-		"scrap_reasons": frappe.get_all(
-			"Scrap Reason",
-			filters={"disabled": 0},
-			pluck="name",
-			order_by="name asc",
-			limit_page_length=0,
-		),
+		"scrap_reasons": _scrap_reasons(),
+		"issue_reasons": list(utils.ISSUE_REASONS),
+		"replacement_enabled": bool(get_settings().replacement_operation),
 	}
 
 
@@ -323,7 +355,7 @@ def list_open_operations(search=None, limit=200):
 	out = []
 	for c in cards:
 		p = progress.get(c.name, {})
-		remaining = utils.remaining_qty(c.for_quantity, p.get("good"), p.get("scrap"))
+		remaining = utils.remaining_qty(c.for_quantity, p.get("good"))
 		if remaining <= 0:
 			continue
 		out.append(
@@ -361,6 +393,17 @@ def get_state(employee, search=None):
 	}
 
 
+@frappe.whitelist()
+def get_entry_time(employee, row_name):
+	"""Live duration / break / net minutes of the worker's open entry (the issue-minutes limit)."""
+	_check_access()
+	emp = _get_active_employee(employee)
+	_fetch_own_open_row(emp.name, row_name)
+	from_time = frappe.db.get_value("Job Card Time Log", row_name, "from_time")
+	minutes, brk, net = times_for(from_time, now_datetime())
+	return {"minutes": flt(minutes, 2), "break_minutes": flt(brk, 2), "net_minutes": flt(net, 2)}
+
+
 # --------------------------------------------------------------------------- write methods
 @frappe.whitelist(methods=["POST"])
 @_retry_on_conflict
@@ -387,8 +430,8 @@ def start(employee, job_card, machine=None):
 	if not frappe.db.exists("Workstation", {"name": machine, "disabled": 0}):
 		frappe.throw(_("Machine {0} is not available.").format(machine))
 
-	good, scrap = _closed_totals(doc)
-	if utils.remaining_qty(doc.for_quantity, good, scrap, doc.precision("for_quantity")) <= 0:
+	good = _closed_good(doc)
+	if utils.remaining_qty(doc.for_quantity, good, doc.precision("for_quantity")) <= 0:
 		frappe.throw(_("Nothing is left to make on this operation."))
 
 	doc.append(
@@ -400,6 +443,7 @@ def start(employee, job_card, machine=None):
 			"scrap_qty": 0,
 			"workstation": machine,
 			"from_tablet": 1,
+			"entry_type": "Normal",
 		},
 	)
 	doc.save(ignore_permissions=True)
@@ -409,53 +453,71 @@ def start(employee, job_card, machine=None):
 
 @frappe.whitelist(methods=["POST"])
 @_retry_on_conflict
-def finish(employee, row_name, good_qty=0, scrap_qty=0, scrap_reason=None):
-	"""Finish the worker's own open entry: end time and duration are set automatically."""
+def finish(
+	employee,
+	row_name,
+	good_qty=0,
+	scrap_qty=0,
+	scrap_reason=None,
+	issue_reason=None,
+	issue_minutes=None,
+	issue_note=None,
+):
+	"""Finish the worker's own open entry: end time and duration are set automatically.
+
+	Good may not exceed what is left; scrap has no upper limit (scrapped pieces are made again).
+	Good = scrap = 0 is allowed only with an issue reason. Issue minutes are part of the entry's
+	net working time (break excluded) and never change the recorded time."""
 	_check_access()
 
 	try:
 		good = utils.parse_qty(good_qty, "Good quantity")
 		scrap = utils.parse_qty(scrap_qty, "Scrap quantity")
+		issue_mins = utils.parse_qty(issue_minutes, "Issue minutes")
 	except utils.QtyError as exc:
 		_msg_qty_error(exc)
+	issue_reason = (issue_reason or "").strip()
+	issue_note = (issue_note or "").strip()
 
 	emp = _get_active_employee(employee, lock=True)
-	job_card = _fetch_own_open_row(emp.name, row_name)
-
 	# Row lock on the Job Card: two workers finishing at the same moment cannot both overbook it.
-	doc = frappe.get_doc("Job Card", job_card, for_update=True)
-	if doc.docstatus != 0:
-		frappe.throw(_("This Job Card is already submitted or cancelled."))
-
-	row = next((r for r in doc.time_logs if r.name == row_name), None)
-	if not row or row.to_time:
-		frappe.throw(_("This entry is already finished."))
+	doc, row = _load_own_open_row(emp.name, row_name)
+	if doc.is_corrective_job_card:
+		frappe.throw(_("This is replacement work. Finish it as replacement work."))
 
 	precision = doc.precision("for_quantity")
-	good_done, scrap_done = _closed_totals(doc, exclude_row=row_name)
-	remaining = utils.remaining_qty(doc.for_quantity, good_done, scrap_done, precision)
+	good_done = _closed_good(doc, exclude_row=row_name)
+	remaining = utils.remaining_qty(doc.for_quantity, good_done, precision)
 
+	end = now_datetime()
+	_mins, _brk, net = times_for(row.from_time, end)
 	try:
-		utils.check_finish(good, scrap, scrap_reason, remaining, precision)
+		utils.check_issue(issue_reason, issue_mins, net)
+		utils.check_finish(good, scrap, scrap_reason, remaining, issue_reason, precision)
 	except utils.QtyError as exc:
 		_msg_qty_error(exc)
 
-	if scrap > 0 and not frappe.db.exists("Scrap Reason", {"name": scrap_reason, "disabled": 0}):
-		frappe.throw(_("Scrap reason {0} is not available.").format(scrap_reason))
+	if scrap > 0:
+		_check_scrap_reason(scrap_reason)
 
-	row.to_time = now_datetime()
+	row.to_time = end
 	row.completed_qty = good
 	row.scrap_qty = scrap
 	row.scrap_reason = scrap_reason if scrap > 0 else None
+	row.issue_reason = issue_reason or None
+	row.issue_minutes = issue_mins if issue_reason else 0
+	row.issue_note = issue_note or None
 	doc.save(ignore_permissions=True)
 
-	good_done, scrap_done = _closed_totals(doc)
+	good_done = _closed_good(doc)
 	return {
 		"job_card": doc.name,
 		"minutes": flt(row.time_in_mins, 2),
+		"net_minutes": flt(row.net_minutes, 2),
+		"break_minutes": flt(row.break_minutes, 2),
 		"good": good,
 		"scrap": scrap,
-		"remaining": utils.remaining_qty(doc.for_quantity, good_done, scrap_done, precision),
+		"remaining": utils.remaining_qty(doc.for_quantity, good_done, precision),
 	}
 
 
@@ -478,9 +540,250 @@ def cancel_start(employee, row_name):
 		frappe.throw(_("Only an open entry without quantity can be cancelled."))
 
 	doc.remove(row)
+	if not doc.time_logs and doc.is_corrective_job_card:
+		# an empty replacement card the tablet made is not kept as clutter
+		frappe.delete_doc("Job Card", doc.name, ignore_permissions=True, force=True)
+		return {"active": _open_entries(emp.name)}
+
 	if not doc.time_logs:
 		doc.actual_start_date = None
 		doc.actual_end_date = None
 	doc.save(ignore_permissions=True)
 
 	return {"active": _open_entries(emp.name)}
+
+
+# --------------------------------------------------------------------------- replacement work
+def _replacement_operation():
+	op = get_settings().replacement_operation
+	if not op or not frappe.db.get_value("Operation", op, "is_corrective_operation"):
+		frappe.throw(_("Replacement work is not set up. Ask your supervisor (Shopfloor Tablet Settings)."))
+	return op
+
+
+def _check_replacement_work_order(work_order):
+	status = frappe.db.get_value("Work Order", {"name": work_order, "docstatus": 1}, "status")
+	if not status:
+		frappe.throw(_("Work Order {0} was not found.").format(work_order))
+	if status not in REPLACEMENT_WORK_ORDER_STATUS:
+		frappe.throw(_("Work Order {0} is {1}. Replacement work is not possible.").format(work_order, status))
+
+
+@frappe.whitelist()
+def list_replacement_work_orders(search=None, limit=100):
+	"""Submitted Work Orders (also completed ones) that have operations to do replacement work on."""
+	_check_access()
+
+	filters = {"docstatus": 1, "status": ["in", sorted(REPLACEMENT_WORK_ORDER_STATUS)]}
+	or_filters = None
+	if search and search.strip():
+		txt = f"%{search.strip()}%"
+		or_filters = [["name", "like", txt], ["production_item", "like", txt], ["item_name", "like", txt]]
+
+	orders = frappe.get_all(
+		"Work Order",
+		filters=filters,
+		or_filters=or_filters,
+		fields=["name", "production_item", "item_name", "status", "qty", "stock_uom"],
+		order_by="modified desc",
+		limit_page_length=cint(limit) or 100,
+	)
+	if not orders:
+		return []
+
+	with_cards = set(
+		frappe.get_all(
+			"Job Card",
+			filters={
+				"work_order": ["in", [o.name for o in orders]],
+				"docstatus": ["<", 2],
+				"is_corrective_job_card": 0,
+			},
+			pluck="work_order",
+			distinct=True,
+			limit_page_length=0,
+		)
+	)
+	return [
+		{
+			"work_order": o.name,
+			"item_code": o.production_item,
+			"item_name": o.item_name or o.production_item,
+			"status": o.status,
+			"qty": flt(o.qty),
+			"uom": o.stock_uom,
+		}
+		for o in orders
+		if o.name in with_cards
+	]
+
+
+@frappe.whitelist()
+def list_replacement_operations(work_order):
+	"""All operations (Job Cards) of a Work Order, also finished or submitted ones."""
+	_check_access()
+	_check_replacement_work_order(work_order)
+
+	cards = frappe.get_all(
+		"Job Card",
+		filters={"work_order": work_order, "docstatus": ["<", 2], "is_corrective_job_card": 0},
+		fields=[
+			"name",
+			"operation",
+			"sequence_id",
+			"workstation",
+			"for_quantity",
+			"total_completed_qty",
+			"docstatus",
+			"status",
+			"production_item",
+			"item_name",
+			"stock_uom",
+		],
+		order_by="sequence_id asc, operation asc, name asc",
+		limit_page_length=0,
+	)
+	progress = _progress([c.name for c in cards])
+	return [
+		{
+			"job_card": c.name,
+			"work_order": work_order,
+			"operation": c.operation,
+			"sequence_id": cint(c.sequence_id) or None,
+			"machine": c.workstation,
+			"item_name": c.item_name or c.production_item,
+			"uom": c.stock_uom,
+			"required": flt(c.for_quantity),
+			"good": flt(c.total_completed_qty) if c.docstatus == 1 else flt(progress.get(c.name, {}).get("good")),
+			"submitted": c.docstatus == 1,
+			"status": c.status,
+		}
+		for c in cards
+	]
+
+
+def _draft_corrective_card(source, operation):
+	"""The ONE draft corrective Job Card the tablet uses for a source Job Card, or None.
+	A locking read, so it also sees a card another worker created a moment ago."""
+	rows = frappe.db.sql(
+		"""
+		select name from `tabJob Card`
+		where for_job_card = %s and is_corrective_job_card = 1 and docstatus = 0 and operation = %s
+		order by creation asc limit 1
+		for update
+		""",
+		(source, operation),
+	)
+	return rows[0][0] if rows else None
+
+
+def _new_corrective_card(source, operation, for_operation):
+	"""ERPNext's own make_corrective_job_card. It checks the caller's Job Card read/create
+	permission, which workers do not have; the caller's tablet rights were checked already, so the
+	mapping runs as Administrator and the card is inserted as the worker."""
+	from erpnext.manufacturing.doctype.job_card.job_card import make_corrective_job_card
+
+	user = frappe.session.user
+	frappe.session.user = "Administrator"
+	try:
+		doc = make_corrective_job_card(source, operation=operation, for_operation=for_operation)
+	finally:
+		frappe.session.user = user
+
+	# Replacement work makes no pieces: with quantity 0 ERPNext's rule
+	# "completed + process loss + pending = quantity" holds at submit (0 = 0) and the card adds
+	# nothing to the quantities of the source operation or the Work Order. Material for the
+	# replacement is not planned on this card.
+	doc.for_quantity = 0
+	doc.set("items", [])
+	doc.flags.ignore_permissions = True
+	return doc
+
+
+@frappe.whitelist(methods=["POST"])
+@_retry_on_conflict
+def start_replacement(employee, job_card, machine=None):
+	"""Start replacement work for an operation (source Job Card), on its draft corrective card."""
+	_check_access()
+	emp = _get_active_employee(employee, lock=True)
+
+	existing = _open_entries(emp.name)
+	if existing:
+		e = existing[0]
+		frappe.throw(
+			_("{0} already has active work on {1} ({2}). Finish it first.").format(
+				emp.employee_name or emp.name, e["operation"], e["work_order"]
+			)
+		)
+
+	operation = _replacement_operation()
+
+	# lock the source card: two workers starting replacement on it get one corrective card
+	src = frappe.db.sql(
+		"""select name, docstatus, is_corrective_job_card, work_order, operation, workstation
+		from `tabJob Card` where name = %s for update""",
+		job_card,
+		as_dict=True,
+	)
+	src = src[0] if src else None
+	if not src or src.docstatus == 2 or src.is_corrective_job_card or not src.work_order:
+		frappe.throw(_("This operation cannot get replacement work."))
+	_check_replacement_work_order(src.work_order)
+
+	machine = machine or src.workstation
+	if not machine:
+		frappe.throw(_("Choose a machine."))
+	if not frappe.db.exists("Workstation", {"name": machine, "disabled": 0}):
+		frappe.throw(_("Machine {0} is not available.").format(machine))
+
+	row = {
+		"employee": emp.name,
+		"from_time": now_datetime(),
+		"completed_qty": 0,
+		"scrap_qty": 0,
+		"workstation": machine,
+		"from_tablet": 1,
+		"entry_type": "Replacement",
+	}
+	name = _draft_corrective_card(src.name, operation)
+	if name:
+		doc = frappe.get_doc("Job Card", name, for_update=True)
+		doc.append("time_logs", row)
+		doc.save(ignore_permissions=True)
+	else:
+		doc = _new_corrective_card(src.name, operation, src.operation)
+		doc.append("time_logs", row)
+		doc.insert()
+
+	return {"active": _open_entries(emp.name), "job_card": doc.name}
+
+
+@frappe.whitelist(methods=["POST"])
+@_retry_on_conflict
+def finish_replacement(employee, row_name, reason=None, note=None):
+	"""Finish replacement work: time, reason and note only. No good, no scrap."""
+	_check_access()
+	reason = (reason or "").strip()
+	note = (note or "").strip()
+	if not reason:
+		frappe.throw(_("Choose a reason for the replacement work."), title=_("Check the entry"))
+
+	emp = _get_active_employee(employee, lock=True)
+	doc, row = _load_own_open_row(emp.name, row_name)
+	if not doc.is_corrective_job_card:
+		frappe.throw(_("This is not replacement work."))
+	_check_scrap_reason(reason)
+
+	row.to_time = now_datetime()
+	row.completed_qty = 0
+	row.scrap_qty = 0
+	row.replacement_reason = reason
+	row.issue_note = note or None
+	doc.save(ignore_permissions=True)
+
+	return {
+		"job_card": doc.name,
+		"minutes": flt(row.time_in_mins, 2),
+		"net_minutes": flt(row.net_minutes, 2),
+		"break_minutes": flt(row.break_minutes, 2),
+	}
