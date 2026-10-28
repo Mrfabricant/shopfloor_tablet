@@ -1,0 +1,84 @@
+{
+ "actions": [],
+ "creation": "2026-10-28 09:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "break_section",
+  "break_start",
+  "break_end",
+  "break_timezone",
+  "replacement_section",
+  "replacement_operation"
+ ],
+ "fields": [
+  {
+   "description": "Daily break. Used only to calculate break and net working minutes in reports; the recorded start/end times are never changed.",
+   "fieldname": "break_section",
+   "fieldtype": "Section Break",
+   "label": "Break"
+  },
+  {
+   "default": "10:30:00",
+   "fieldname": "break_start",
+   "fieldtype": "Time",
+   "label": "Break Start",
+   "reqd": 1
+  },
+  {
+   "default": "11:00:00",
+   "fieldname": "break_end",
+   "fieldtype": "Time",
+   "label": "Break End",
+   "reqd": 1
+  },
+  {
+   "default": "Europe/Zagreb",
+   "description": "Time zone of the break times, e.g. Europe/Zagreb",
+   "fieldname": "break_timezone",
+   "fieldtype": "Data",
+   "label": "Break Time Zone",
+   "reqd": 1
+  },
+  {
+   "fieldname": "replacement_section",
+   "fieldtype": "Section Break",
+   "label": "Replacement Work"
+  },
+  {
+   "description": "Corrective operation used for replacement work on the tablet",
+   "fieldname": "replacement_operation",
+   "fieldtype": "Link",
+   "label": "Replacement Operation",
+   "options": "Operation"
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-10-28 09:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Shopfloor Tablet",
+ "name": "Shopfloor Tablet Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "read": 1,
+   "role": "System Manager",
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Manufacturing Manager",
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "Manufacturing User"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

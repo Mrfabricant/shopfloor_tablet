@@ -2,3 +2,4 @@
 shopfloor_tablet.patches.ensure_module_and_role
 
 [post_model_sync]
+shopfloor_tablet.patches.backfill_break_and_entry_type
