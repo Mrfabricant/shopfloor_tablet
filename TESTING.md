@@ -1,7 +1,8 @@
 # Test brief (for Claude Code or a human)
 
-Steps 1-4 and the HTTP part of step 5 have been run on `mark.local` (2026-10-27) and pass. The
-browser click-through in step 5 has not been run yet.
+Status 2026-10-28 (after the break / scrap / replacement / issue / worker-switch changes): steps 1,
+3, 3b and 4 have been run on `mark.local` and pass. Step 5a (HTTP checks) was updated but **not run**
+(needs the test users' password). The browser click-through in step 5b has not been run.
 
 Site: `mark.local` in `~/mark-prod-v16` (WSL distro `erpnext16`), ERPNext 16.52.1, Frappe 16.53.0.
 
@@ -12,7 +13,10 @@ bench --site mark.local migrate
 bench --site mark.local clear-cache
 ```
 Verify (and report any failure with the full traceback):
-- `Custom Field` rows exist for `Job Card Time Log`: `workstation`, `scrap_qty`, `scrap_reason`, `from_tablet`.
+- `Custom Field` rows exist for `Job Card Time Log`: `workstation`, `scrap_qty`, `scrap_reason`, `from_tablet`,
+  `entry_type`, `replacement_reason`, `break_minutes`, `net_minutes`, `issue_reason`, `issue_minutes`, `issue_note`.
+- `Shopfloor Tablet Settings`: break 10:30:00-11:00:00, Europe/Zagreb, Replacement Operation "Replacement Work"
+  (an Operation with `is_corrective_operation = 1`). Existing time logs have `entry_type` and break/net minutes.
 - `Role` "Shop Floor Worker", `DocType` "Scrap Reason" with 8 starter records, `Page` "shopfloor-tablet",
   `Report` "Operation Progress" and "Worker Time Entries".
 - `frappe.get_hooks("override_doctype_class")` resolves, and `frappe.get_doc("Job Card", <any>)` is a `ShopfloorJobCard`.
@@ -28,19 +32,30 @@ material transfer, or transfer materials), submit it. Check that draft Job Cards
 cd ~/mark-prod-v16/apps/shopfloor_tablet
 python -m unittest shopfloor_tablet.tests.test_utils -v
 ```
-(`test_override_logic` skips itself when frappe is importable.)
+(`test_override_logic` skips itself when frappe is importable; run it with a plain `python3` outside the
+bench env: `python3 -m unittest shopfloor_tablet.tests.test_utils shopfloor_tablet.tests.test_override_logic`.)
+
+## 3b. Page script (Node, no browser)
+```bash
+cd ~/mark-prod-v16/apps/shopfloor_tablet
+node --check shopfloor_tablet/shopfloor_tablet/page/shopfloor_tablet/shopfloor_tablet.js
+node --test shopfloor_tablet/tests/js/*.test.js
+```
+Loads the real page script with a stub frappe/jQuery and delays answers for worker A while worker B is
+selected (get_state, start, finish, cancel_start, the 30 s refresh, idle return, logout).
 
 ## 4. End-to-end scenario (rolls back, keeps no data)
 ```bash
 cd ~/mark-prod-v16
 bench --site mark.local execute shopfloor_tablet.tests.scenario.run
-# with a second Job Card on the SAME workstation (proves two workers can use one machine on different orders):
-bench --site mark.local execute shopfloor_tablet.tests.scenario.run --kwargs "{'other_job_card': 'PO-JOB-0000X'}"
 ```
-Every line should say PASS. For each FAIL decide whether the app or the scenario is wrong and fix it.
+It creates its own Work Order (qty 10, skip material transfer) from the BOM of an existing Work Order
+and covers: finish rules, 7 good + 2 scrap -> 3 left, 0/0 with an issue reason, issue minutes above net
+refused, break/net on tablet and desk rows, submit with 10 good / 2 scrap (pending 0, process loss 0,
+Work Order operation 10), replacement work (one shared corrective card, no good/scrap, submits,
+source quantities unchanged, empty card deleted on cancel), both reports, and the own-name rule as
+`worker1@example.com`. Every line should say PASS (2026-10-28: 55 passed, 0 failed).
 Pay special attention to:
-- the finish-time machine-overlap check (step 0) - standard ERPNext should reject it, the app must not;
-- header `process_loss_qty` after saves, and `pending_qty` after submit (step 10);
 - whether `frappe.get_doc(..., for_update=True)` + `save(ignore_permissions=True)` works for a user that only has the Shop Floor Worker role (repeat a start/finish as such a user via the UI, step 5).
 
 ## 5a. HTTP checks as real users, with real concurrent requests (commits data, then removes its rows)
@@ -62,6 +77,11 @@ same Work Order). Save collisions that were retried are logged in `sites/mark.lo
 - shared: name list appears; search works; pick a name; leave 90 s idle -> back to the name list.
 - Two browsers: worker A and worker B start the same operation; both finish; quantities add up; the card shows
   "Working now" for the other worker.
+- Progress bar shows good + left against planned; scrap appears separately ("Scrap 2 (made again)").
+- Finish dialog: "Working time without break" is shown; issue minutes above it are refused; 0 / 0 only with an issue.
+- Replacement work tab: Work Order -> operation (also completed ones) -> machine -> START REPLACEMENT; the active
+  card says "Replacement work"; Finish asks only for a reason and a note.
+- Shared tablet: pick worker A, immediately Change worker -> B: nothing of A appears on B's screen.
 - No prices/rates visible anywhere on the page or in the network responses.
 - Reports render without errors; an open entry older than 12 h (set `from_time` back in the DB) shows red.
 - Supervisor (Manufacturing Manager): open a Job Card, edit a tablet row's To Time / quantities, save, submit.
