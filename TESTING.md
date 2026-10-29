@@ -43,6 +43,10 @@ node --test shopfloor_tablet/tests/js/*.test.js
 ```
 Loads the real page script with a stub frappe/jQuery and delays answers for worker A while worker B is
 selected (get_state, start, finish, cancel_start, the 30 s refresh, idle return, logout).
+`stale_state.test.js` covers the same worker without switching: a get_state asked before a start,
+finish, cancel or replacement start/finish (or before a newer get_state) that answers late is dropped,
+and nothing is rendered over an open Finish dialog. `SFT_GUARD_OFF=1 node --test ...` disables that
+guard to show the race (2026-10-29: 19 pass with the guard, 9 fail without it).
 
 ## 4. End-to-end scenario (rolls back, keeps no data)
 ```bash

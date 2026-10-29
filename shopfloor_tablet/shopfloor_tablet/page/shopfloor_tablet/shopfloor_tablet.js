@@ -73,6 +73,12 @@
 			// Every request remembers the generation and the worker it was made for. Switching
 			// worker (or logging out) starts a new generation, so late answers are dropped.
 			this.gen = 0;
+			// Same worker, no switching: a get_state answer is outdated when a write (start, finish,
+			// cancel, replacement start/finish) was sent or answered after it was asked, or when a
+			// newer get_state was sent. The epoch counts write sends and answers.
+			this.epoch = 0;
+			this.writing = 0; // writes sent and not answered yet
+			this.stateSeq = 0; // last get_state sent
 			// Work Order -> colour index. Kept for the session so a Work Order keeps its colour
 			// across refreshes and on the active-work card.
 			this.accents = {};
@@ -119,8 +125,32 @@
 			);
 		}
 
+		// A call that changes the worker's entries. Refreshes asked before it are outdated.
+		async write(method, args) {
+			const gen = this.gen;
+			this.epoch++;
+			this.writing++;
+			try {
+				return await this.request(method, args);
+			} finally {
+				// a newer generation already reset the counters
+				if (gen === this.gen) {
+					this.epoch++;
+					this.writing--;
+				}
+			}
+		}
+
+		// The get_state answer for this ticket may be applied: no write sent or answered since it was
+		// asked, no newer get_state sent, and no Finish dialog open that a render would wipe.
+		state_current(t) {
+			return t.epoch === this.epoch && t.seq === this.stateSeq && !this.writing && !this.s.finishing;
+		}
+
 		new_generation() {
 			this.gen++;
+			this.epoch++;
+			this.writing = 0;
 			this.s.busy = false;
 			this.$root.removeClass("sft-busy");
 			clearTimeout(this.searchTimer);
@@ -323,8 +353,10 @@
 		async load_state(quiet) {
 			if (!this.s.employee) return;
 			this.lastRefresh = Date.now();
+			const ticket = { epoch: this.epoch, seq: ++this.stateSeq };
 			try {
 				const st = await this.request("get_state", { search: this.s.search || "" });
+				if (!this.state_current(ticket)) return;
 				this.s.active = st.active || [];
 				this.s.operations = st.operations || [];
 				this.s.loadedAt = Date.now();
@@ -339,7 +371,7 @@
 					this.render_main();
 				}
 			} catch (e) {
-				if (is_stale(e)) return;
+				if (is_stale(e) || !this.state_current(ticket)) return;
 				if (!quiet) {
 					this.s.error = e.message;
 					this.render_main();
@@ -825,7 +857,7 @@
 			}
 			return this.run(async () => {
 				try {
-					const r = await this.request("start", { job_card: op.job_card, machine: this.s.machine });
+					const r = await this.write("start", { job_card: op.job_card, machine: this.s.machine });
 					this.after_start(r, "Started. The time is running.");
 				} catch (e) {
 					if (is_stale(e)) return;
@@ -845,7 +877,7 @@
 			}
 			return this.run(async () => {
 				try {
-					const r = await this.request("start_replacement", {
+					const r = await this.write("start_replacement", {
 						job_card: op.job_card,
 						machine: this.s.machine,
 					});
@@ -862,7 +894,7 @@
 			frappe.confirm("Cancel this start? Nothing will be recorded.", () =>
 				this.run(async () => {
 					try {
-						const r = await this.request("cancel_start", { row_name: row });
+						const r = await this.write("cancel_start", { row_name: row });
 						this.s.active = r.active || [];
 						this.s.flash = "Start cancelled.";
 						this.s.error = "";
@@ -1034,14 +1066,14 @@
 				try {
 					let flash;
 					if (repl) {
-						const r = await this.request("finish_replacement", {
+						const r = await this.write("finish_replacement", {
 							row_name: a.row_name,
 							reason: v.repl_reason,
 							note: v.note,
 						});
 						flash = `Replacement work saved: ${fmt(r.net_minutes)} min without break.`;
 					} else {
-						const r = await this.request("finish", {
+						const r = await this.write("finish", {
 							row_name: a.row_name,
 							good_qty: v.good,
 							scrap_qty: v.scrap,
